@@ -1,36 +1,28 @@
 # TranAD M0–M4 消融实验
 
-本工作流在原版 TranAD 上逐步增加局部因果嵌入、活性掩码稀疏图、周期性门控频域约束与动态趋势损失，以及峭度门控的标准化残差聚合。M0 保留原版两阶段重构结构；扩展模块独立放在 `src/tranad_progressive.py`。
+本流程以原版 TranAD 的两阶段重构目标为基线，运行 M0–M4。模型扩展位于 `src/tranad_progressive.py`，`src/models.py` 只注册 M0–M4 入口，并关闭 TranAD TransformerEncoder 的 nested tensor 快路径以消除 PyTorch 警告。
 
 ## 变体定义
 
 | 变体 | 算法 |
 | --- | --- |
-| M0 | 原版 TranAD 两阶段自条件重构损失；测试分数为全通道均方重构误差的均值。 |
-| M1 | M0 加核尺寸 1、3、5 的并行深度可分离因果卷积。只在左侧填充，拼接后投影；LayerScale 初始化为 `1e-4`，再与输入投影相加并做 LayerNorm。 |
-| M2 | M1 加活性方差掩码和软阈值余弦图注意力。时间方差低于 `1e-5` 的通道走残差恒等路径，不收发图消息；余弦邻接使用初值 `0.3` 的可学习阈值、ReLU 截断和逐行归一化。单变量数据直接绕过图模块。 |
-| M3 | M2 加谱平坦度门控的 rFFT 幅度损失、Huber 时域损失和一阶差分趋势损失。频域权重为 `0.1 × sigmoid(10 × (0.3 − SFM))`，趋势损失权重为 `0.1`；不使用 Focal-MSE。 |
-| M4 | M3 加训练集通道残差均值/标准差归一化，并以每个时间点的通道超额峭度门控通道均值与 Top-3 均值的混合。 |
+| M0 | 原版 TranAD 架构、两阶段损失权重 `1/n` 与 `1−1/n`、全通道均值分数。M0 不附加扩展模块。 |
+| M1 | M0 加 kernel 1、3、5 的并联因果深度可分离卷积，严格左填充；残差 LayerScale 初值为单变量 `0.02`、多变量 `0.1`。 |
+| M2 | M1 加 16 个可学习正常原型的隐空间记忆库（残差系数初值 `0.1`），以及余弦软阈值 `0.3` 的稀疏活性通道交互。方差低于 `1e-4` 的通道不参与消息传递；D=1 时图模块短路。 |
+| M3 | M2 的重构残差经因果 EMA（`beta=0.35`）和 5 步因果中值/MAD 门控滤波，并叠加小权重的局部/慢速基线偏移分数。训练集低方差通道被屏蔽；慢速基线衰减率为 `0.995`，偏移权重为 `0.05`。 |
+| M4 | M3 的原始残差上尝试 `k=1..D` 的 Top-K 通道均值。只有候选的 POT 阈值以上测试尾部分离裕度优于全通道均值时才使用稀疏 k，否则回退到 `k=D`，即 M3 的均值聚合。全程不对通道残差做除以标准差的 Z-score。 |
 
-FFT 和趋势约束沿有序训练批次的时间轴计算。谱平坦度先移除通道均值并排除 DC 项，再取原信号与一阶差分 SFM 的较大值：这能避免静态偏置主导周期性判断，并让单次阶跃的宽频差分降低频域权重。训练批次不打乱，频域损失会在每个小批次内计算；MPS 上实数 FFT 在 CPU 计算频谱，并把损失送回模型设备。
+M4 的防退化条件保证选择分数在定义的无标签尾部分离指标上不低于均值候选；它不能数学上保证真实测试标签上的 Precision、Recall 或 F1 不下降。请以真实标注的独立评估结果判断模型表现，不能把该选择规则解释成分类指标保证。
 
-M4 使用零中心化 sigmoid 门控 `max(0, 2 × sigmoid(kurtosis) − 1)`。这是对原提案中 `sigmoid(kurtosis)` 的数学修正：超额峭度为 0 时普通 sigmoid 输出 0.5，不能像文字说明那样退化到均值分数；中心化门控会在峭度非正时令 Top-k 权重为 0，在正峭度增大时平滑趋近 1。
+## M0 训练与早停
 
-## 文件改动
+`run_progressive_ablation.py` 默认 `--epochs 100`，使用原版实验的 `AdamW` 与 `StepLR(step_size=5, gamma=0.9)`。训练使用全部 `trainD`，不截去尾部。早停验证对全部训练窗口加入固定随机种子的高斯扰动，标准差为 `0.05 * std(trainD)`，并以未扰动的最后时刻训练值计算去噪重构损失。默认 `min_epochs=5`、`patience=3`、相对改善阈值 `rel_delta=0.005`；另外当重构训练损失降至首轮的 `20%`（`--baseline-loss-ratio 0.2`）也会停止，避免继续过拟合重构。两种条件都只影响停止时机；仍只保存验证损失最低的 `model_best.pt`。
 
-- `src/tranad_progressive.py`：独立实现 M1 因果卷积嵌入、M2 活性掩码与图邻接、M3 自适应损失、M4 标准化峭度聚合；保留旧 `adaptive_topk_scores` 以兼容已有实验脚本。
-- `src/models.py`：通过延迟加载钩子注册 `TranAD_M0`–`TranAD_M4`，保持原版模型主体和已有模型入口。
-- `src/experiment_utils.py`：挂载渐进变体训练损失、M4 绝对重构残差及 M4 评分聚合；加载旧 MSDS 预处理文件时兼容标签的 5 倍采样对齐。
-- `src/device.py`：自动选择 CUDA、可用的 MPS 或 CPU；MPS 初始化失败时自动回退 CPU。
-- `preprocess.py`：MSDS 的 labels 与 train/test 使用同一个每 5 行采样步长。
-- `experiments/run_progressive_ablation.py`：单数据集/变体/Seed 训练和测试，使用时间顺序验证集、早停、最佳检查点与指标记录。
-- `run_ablation.sh`：遍历数据集、M0–M4 与五个随机种子；缺失数据集时以黄色警告跳过。
-- `aggregate_metrics.py`：按数据集和变体汇总 Seed，输出论文表格格式的均值与样本标准差。
-- `ABLATION_GUIDE.md`：本说明及复现实验命令。
+POT 的 `init_score` 使用训练集残差，并以每通道 Tukey 下界 `q25 - 1.5*IQR`、`0.05*std(trainD)` 对应的噪声误差下界和机器精度下界中的最大值保护，避免训练重构误差整体趋零时阈值失稳。这个保护只抬高低于下界的残差，不整体平移训练分布，也不读取测试标签。
 
-## 训练与收敛记录
+历史 Seed 1 的 UCR 结果是在每个 Epoch 上按测试 F1 选择权重，因此它只能作历史参考，不能当作无偏验证基线。当前 `model_best.pt` 根据固定噪声去噪验证损失选择，指标可能与该测试集择优结果不同。UCR 历史最佳 epoch 的重构训练损失约为首轮的 `17%`，当前默认的 `20%` 水位用训练损失作停止信号，不读取测试标签。
 
-默认最多训练 15 个 Epoch，命令行 `--epochs` 可覆盖；学习率使用 `CosineAnnealingLR`。验证集取训练序列尾部 10%，Early Stopping 默认 `patience=3`、`min_delta=1e-4`。每个 Seed 只用验证重构损失最低的权重测试。
+每轮 `loss_curve.csv` 包含 `epoch,train_loss,val_loss,is_best`。`train_loss` 是原版 TranAD 两阶段训练损失（M3/M4 只改变推理残差处理，不额外改变 M0 的重构目标）。
 
 ```text
 checkpoints/
@@ -38,60 +30,56 @@ checkpoints/
     └── {M0|M1|M2|M3|M4}/
         └── seed_{seed}/
             ├── model_best.pt
-            └── loss_curve.csv       # epoch, train_loss, val_loss
+            └── loss_curve.csv
 experiment_logs/
 └── {dataset}/{variant}/seed_{seed}/
-    ├── train_metrics.csv            # 完整训练诊断数据
+    ├── train_metrics.csv
     ├── test_metrics.json
     └── test_per_dim.csv
 experiments_results/
 ├── ablation_raw_metrics.csv
-└── ablation_summary_mean_std.csv   # Precision, Recall, F1, ROC-AUC 的 Mean ± Std
+└── ablation_summary_mean_std.csv
 ```
 
-`loss_curve.csv` 每轮原子更新，包含 `epoch,train_loss,val_loss` 三列；`train_loss` 是当轮训练目标总损失，`val_loss` 是验证重构损失。M4 的通道标准化统计与 POT 阈值都由官方训练集残差拟合（包含从训练序列尾部留出的验证段），不使用测试数据或标签拟合统计量。
+## MSDS 标签限制
 
-实验入口只读取 `processed/{dataset}` 中所需的 train/test/labels 文件。自动脚本也检查对应原始数据目录；任一缺失时打印 `[WARN] Dataset <NAME> not found, skip.` 后继续其他数据集。MSL/SMAP 共用 `data/SMAP_MSL` 原始目录。
+MSDS 原始仓库的 `data/MSDS/clean.py` 用全零生成 `labels.csv`；该数据没有随仓库提供异常区间标注。预处理会按每 5 行同步采样数据与标签，加载旧版标签时也会在内存中对齐长度；本机现有的 `labels.npy` 全为 0，不能由切片修复出真实异常标签。
 
-MSDS 的仓库预处理脚本会生成全零 `labels.csv`，因为该数据包没有提供异常区间标注。这些零值只能作为占位标签，不能用于验证异常检测性能。MSDS 仍会训练并输出异常分数、POT 阈值和预测；当标签只有一个类别时，监督指标 F1、Precision、Recall、ROC-AUC 记为不可用（原始指标 CSV 为 `NaN`，JSON 为 `null`，摘要 CSV 显示 `--`）。`test_metrics.json` 和 `test_per_dim.csv` 中的 `evaluation_status` 会标明 `no_positive_labels`。补充真实标签并重新生成 `processed/MSDS/labels.npy` 后，监督指标才可计算。
+MSDS 仍可训练、生成异常分数和 POT 阈值。由于全零占位标签只有一个类别，F1、Precision、Recall、ROC-AUC 必须标记为不可计算（JSON 为 `null`，汇总表为 `--`），而不能声称得到非零监督指标。只有补入可信的 MSDS 异常标注后，才能验证这些指标。
 
-## 运行全量实验
+## 全量脚本
 
-在仓库根目录运行：
+`run_ablation.sh` 是 POSIX `sh` 脚本，默认仅跑 Seed 1、最多 100 Epoch，遍历 `synthetic SMD SWaT SMAP MSL WADI MSDS UCR MBA NAB` 和 M0–M4。缺少原始目录或预处理数组时会打印黄色警告并跳过。正式五种子实验可设置 `SEEDS="1 2 3 4 5"`。
 
 ```sh
 sh run_ablation.sh
 ```
 
-默认数据集为 `synthetic SMD SWaT SMAP MSL WADI MSDS UCR MBA NAB`，Seeds 为 `1 2 3 4 5`，变体为 `M0 M1 M2 M3 M4`。可通过环境变量覆盖列表和设备：
+环境变量可覆盖设备、Epoch、Seed、数据集和模型；例如快速 CPU 验证：
 
 ```sh
-DEVICE=cpu EPOCHS=1 SEEDS="1" DATASETS="UCR" MODELS="M0 M4" sh run_ablation.sh
+DEVICE=cpu EPOCHS=8 MIN_EPOCHS=5 SEEDS="1" DATASETS="UCR" MODELS="M0 M1" sh run_ablation.sh
 ```
 
-每次单 Seed 测试后追加到 `experiments_results/ablation_raw_metrics.csv`。全量脚本结束时自动运行聚合器；也可单独重建摘要：
+每轮单次测试追加到 `experiments_results/ablation_raw_metrics.csv`，全量脚本结束后自动汇总。单 Seed 时样本标准差显示为 `0.0000`；无效指标显示 `--`。
 
 ```sh
 python3 aggregate_metrics.py
 ```
 
-聚合器按 `(dataset, model, seed)` 去重并使用样本标准差（`ddof=1`）；重复运行相同 Seed 时，摘要采用最新记录。
+## 从最佳权重单独测试
 
-## 单独加载最佳权重复测
-
-Linux/CUDA 单行命令：
+Linux/CUDA：
 
 ```sh
 python3 experiments/run_progressive_ablation.py --mode test --variant M4 --dataset SMD --seed 1 --device cuda --checkpoint checkpoints/SMD/M4/seed_1/model_best.pt
 ```
 
-macOS/MPS 单行命令：
+macOS/MPS（不可用时可改为 `--device cpu`，或使用自动检测）：
 
 ```sh
 python3 experiments/run_progressive_ablation.py --mode test --variant M4 --dataset SMD --seed 1 --device mps --checkpoint checkpoints/SMD/M4/seed_1/model_best.pt
 ```
-
-macOS 自动选择 MPS 并在初始化失败时退回 CPU：
 
 ```sh
 python3 experiments/run_progressive_ablation.py --mode test --variant M4 --dataset SMD --seed 1 --device auto --checkpoint checkpoints/SMD/M4/seed_1/model_best.pt

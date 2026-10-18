@@ -73,11 +73,11 @@ def warn_dataset_missing(dataset):
 
 
 def write_loss_curve(path, history):
-	"""Atomically persist the requested epoch/train/validation loss columns."""
+	"""Atomically persist epoch, train/validation loss, and best-checkpoint flag."""
 	path = Path(path)
 	path.parent.mkdir(parents=True, exist_ok=True)
 	temporary_path = path.with_name(path.name + '.tmp')
-	pd.DataFrame(history, columns=('epoch', 'train_loss', 'val_loss')).to_csv(temporary_path, index=False)
+	pd.DataFrame(history, columns=('epoch', 'train_loss', 'val_loss', 'is_best')).to_csv(temporary_path, index=False)
 	os.replace(temporary_path, path)
 
 
@@ -87,11 +87,13 @@ def parse_args():
 	parser.add_argument('--variant', choices=VARIANTS, required=True)
 	parser.add_argument('--dataset', choices=DATASETS, required=True)
 	parser.add_argument('--seed', type=int, default=1)
-	parser.add_argument('--epochs', type=int, default=15)
+	parser.add_argument('--epochs', type=int, default=100)
 	parser.add_argument('--batch-size', type=int, default=128)
-	parser.add_argument('--validation-fraction', type=float, default=0.1)
+	parser.add_argument('--min-epochs', type=int, default=5)
 	parser.add_argument('--patience', type=int, default=3)
-	parser.add_argument('--min-delta', type=float, default=1e-4)
+	parser.add_argument('--rel-delta', type=float, default=0.005)
+	parser.add_argument('--baseline-loss-ratio', type=float, default=0.2,
+		help='Stop once reconstruction loss reaches this fraction of its first-epoch value.')
 	parser.add_argument('--learning-rate', type=float, default=None)
 	parser.add_argument('--weight-decay', type=float, default=1e-5)
 	parser.add_argument('--device', choices=('auto', 'cpu', 'cuda', 'mps'), default='auto')
@@ -99,7 +101,7 @@ def parse_args():
 		help='Checkpoint path; defaults to checkpoints/{dataset}/{variant}/seed_{seed}/model_best.pt.')
 	parser.add_argument('--log-dir', type=str, default=None)
 	parser.add_argument('--metrics-csv', type=str, default='experiments_results/ablation_raw_metrics.csv')
-	parser.add_argument('--score-agg', choices=('mean', 'kurtosis_gated'), default=None)
+	parser.add_argument('--score-agg', choices=('mean', 'monotonic_topk', 'kurtosis_gated'), default=None)
 	parser.add_argument('--less', action='store_true', help='Train using 20%% of the available training series.')
 	return parser.parse_args()
 
@@ -143,12 +145,16 @@ def main():
 		raise SystemExit('--epochs must be at least 1 when training.')
 	if args.batch_size < 1:
 		raise SystemExit('--batch-size must be at least 1.')
-	if not 0.0 < args.validation_fraction < 1.0:
-		raise SystemExit('--validation-fraction must be between 0 and 1.')
-	if args.patience < 1:
+	if args.mode in ('train', 'train-test') and args.min_epochs < 1:
+		raise SystemExit('--min-epochs must be at least 1.')
+	if args.mode in ('train', 'train-test') and args.epochs < args.min_epochs:
+		raise SystemExit('--epochs must be greater than or equal to --min-epochs.')
+	if args.mode in ('train', 'train-test') and args.patience < 1:
 		raise SystemExit('--patience must be at least 1.')
-	if args.min_delta < 0:
-		raise SystemExit('--min-delta must be non-negative.')
+	if args.mode in ('train', 'train-test') and not 0.0 <= args.rel_delta < 1.0:
+		raise SystemExit('--rel-delta must be in [0, 1).')
+	if args.mode in ('train', 'train-test') and not 0.0 < args.baseline_loss_ratio < 1.0:
+		raise SystemExit('--baseline-loss-ratio must be in (0, 1).')
 
 	seed_everything(args.seed)
 	model_name = f'TranAD_{args.variant}'
@@ -163,11 +169,6 @@ def main():
 			'Anomaly scores and thresholds will still be produced, but '
 			'F1/precision/recall/ROC-AUC are unavailable and will be recorded as NaN/null.'
 		)
-	validation_size = max(1, int(np.ceil(train_np.shape[0] * args.validation_fraction)))
-	if validation_size >= train_np.shape[0]:
-		raise ValueError('Training data must contain at least two points for a train/validation split.')
-	train_split = train_np[:-validation_size]
-	validation_split = train_np[-validation_size:]
 	model = utils['build_model'](
 		model_name,
 		labels.shape[1],
@@ -177,15 +178,16 @@ def main():
 		lr_override=args.learning_rate,
 		seed=args.seed,
 	)
-	train_data, validation_data, _, _ = utils['prepare_experiment_data'](
-		model, train_split, validation_split, device, dtype
-	)
-	# Score normalization and POT calibration use the official training split;
-	# the held-out tail remains available for train-set residual statistics.
-	calibration_data = torch.cat((train_data, validation_data), dim=0)
 	_, test_data, _, _ = utils['prepare_experiment_data'](
-		model, train_split, test_np, device, dtype
+		model, train_np, test_np, device, dtype
 	)
+	train_data, _, _, _ = utils['prepare_experiment_data'](
+		model, train_np, train_np, device, dtype
+	)
+	# Optimize on the full trainD sequence; use deterministic corruption of those
+	# same windows as a denoising early-stopping signal, without truncating data.
+	calibration_data = train_data
+	validation_noise_std = 0.05 * float(np.std(train_np, dtype=np.float64))
 	checkpoint_path = Path(args.checkpoint) if args.checkpoint else (
 		PROJECT_ROOT / 'checkpoints' / args.dataset / args.variant / f'seed_{args.seed}' / 'model_best.pt'
 	)
@@ -197,34 +199,40 @@ def main():
 	if not log_dir.is_absolute():
 		log_dir = PROJECT_ROOT / log_dir
 	log_dir.mkdir(parents=True, exist_ok=True)
-	score_agg = args.score_agg or ('kurtosis_gated' if args.variant == 'M4' else 'mean')
+	score_agg = args.score_agg or ('monotonic_topk' if args.variant == 'M4' else 'mean')
 	config = {
 		'variant': args.variant,
 		'dataset': args.dataset,
 		'seed': args.seed,
 		'epochs': args.epochs,
-		'validation_fraction': args.validation_fraction,
+		'min_epochs': args.min_epochs,
 		'patience': args.patience,
-		'min_delta': args.min_delta,
+		'rel_delta': args.rel_delta,
+		'baseline_loss_ratio': args.baseline_loss_ratio,
+		'validation_noise_std': validation_noise_std,
+		'validation_seed': args.seed + 104729,
 		'batch_size': args.batch_size,
 		'device': str(device),
 		'dtype': str(dtype),
 		'score_agg': score_agg,
-		'lr_scheduler': 'CosineAnnealingLR',
-		'graph_active_variance_epsilon': 1e-5,
+		'lr_scheduler': 'StepLR(step_size=5,gamma=0.9)',
+		'graph_active_variance_epsilon': 1e-4,
 		'graph_soft_threshold_initial': 0.3,
-		'freq_loss_weight': model.freq_loss_weight,
-		'spectral_flatness_threshold': model.spectral_flatness_threshold,
-		'spectral_flatness_steepness': model.spectral_flatness_steepness,
-		'trend_loss_weight': model.trend_loss_weight,
-		'm4_topk': 3,
-		'm4_kurtosis_gate': 'centered_sigmoid',
+		'prototype_count': 16,
+		'prototype_residual_scale': 0.1,
+		'm3_ema_beta': 0.35,
+		'm3_median_window': 5,
+		'm3_mad_scale': 3.0,
+		'm3_horizon_decay': 0.995,
+		'm3_horizon_weight': 0.05,
+		'm4_aggregation': 'monotonic_guarded_raw_residual_topk',
 		'checkpoint': str(checkpoint_path),
 	}
 
 	if args.mode in ('train', 'train-test'):
 		optimizer = torch.optim.AdamW(model.parameters(), lr=model.lr, weight_decay=args.weight_decay)
-		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+		# Match the original TranAD StepLR schedule used for the M0 reference.
+		scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.9)
 		history = []
 		loss_curve = []
 		loss_curve_path = checkpoint_path.parent / 'loss_curve.csv'
@@ -234,12 +242,18 @@ def main():
 		early_stopping_reference = float('inf')
 		best_epoch = None
 		epochs_without_improvement = 0
+		initial_reconstruction_loss = None
 		for epoch in range(args.epochs):
 			metrics = utils['train_experiment_epoch'](
 				model, train_data, optimizer, scheduler, epoch, args.batch_size, aux_weights
 			)
 			validation_loss = utils['validation_reconstruction_loss'](
-				model, validation_data, args.batch_size, epoch
+				model,
+				train_data,
+				args.batch_size,
+				epoch,
+				noise_std=validation_noise_std,
+				seed=args.seed + 104729,
 			)
 			row = {
 				'epoch': epoch + 1,
@@ -247,14 +261,10 @@ def main():
 				'validation_reconstruction_loss': validation_loss,
 			}
 			history.append(row)
-			loss_curve.append({
-				'epoch': epoch + 1,
-				'train_loss': metrics['train_loss'],
-				'val_loss': validation_loss,
-			})
-			write_loss_curve(loss_curve_path, loss_curve)
-			print(row)
-			if validation_loss < best_validation_loss:
+			if initial_reconstruction_loss is None:
+				initial_reconstruction_loss = metrics['recon_loss']
+			is_best = validation_loss < best_validation_loss
+			if is_best:
 				best_validation_loss = validation_loss
 				best_epoch = epoch
 				temporary_checkpoint = checkpoint_path.with_name(checkpoint_path.name + '.tmp')
@@ -268,15 +278,33 @@ def main():
 					config,
 				)
 				os.replace(temporary_checkpoint, checkpoint_path)
-			if validation_loss < early_stopping_reference - args.min_delta:
+			loss_curve.append({
+				'epoch': epoch + 1,
+				'train_loss': metrics['train_loss'],
+				'val_loss': validation_loss,
+				'is_best': is_best,
+			})
+			write_loss_curve(loss_curve_path, loss_curve)
+			print({**row, 'is_best': is_best})
+			if validation_loss < early_stopping_reference * (1.0 - args.rel_delta):
 				early_stopping_reference = validation_loss
 				epochs_without_improvement = 0
 			else:
 				epochs_without_improvement += 1
-			if epochs_without_improvement >= args.patience:
+			reached_baseline_waterline = (
+				epoch + 1 >= args.min_epochs
+				and metrics['recon_loss'] <= initial_reconstruction_loss * args.baseline_loss_ratio
+			)
+			if reached_baseline_waterline:
 				print(
-					f'Early stopping after epoch {epoch + 1}: validation loss did not improve '
-					f'by at least {args.min_delta:g} for {args.patience} consecutive epochs.'
+					f'Early stopping after epoch {epoch + 1}: reconstruction loss reached '
+					f'{args.baseline_loss_ratio:.1%} of its first-epoch value.'
+				)
+				break
+			if epoch + 1 >= args.min_epochs and epochs_without_improvement >= args.patience:
+				print(
+					f'Early stopping after epoch {epoch + 1}: denoising validation loss improved '
+					f'by less than {args.rel_delta:.3%} for {args.patience} consecutive epochs.'
 				)
 				break
 		pd.DataFrame(history).to_csv(log_dir / 'train_metrics.csv', index=False)

@@ -1,0 +1,4 @@
+seed,dataset,model,precision,recall,f1,roc_auc,best_epoch,best_validation_reconstruction_loss,score_agg,selected_topk,threshold,device,checkpoint
+1,MSDS,M0,nan,nan,nan,nan,47,0.0009295436433570264,mean,,0.0015714729419648024,cpu,/Users/Liang/PycharmProjects/TranAD/checkpoints/MSDS/M0/seed_1/model_best.pt
+1,MSDS,M0,nan,nan,nan,nan,47,0.0009295436433570264,mean,,0.001516713825954823,cpu,/Users/Liang/PycharmProjects/TranAD/checkpoints/MSDS/M0/seed_1/model_best.pt
+1,MSDS,M0,nan,nan,nan,nan,8,0.01011521244109467,mean,,0.02504680984343621,cpu,/Users/Liang/PycharmProjects/TranAD/checkpoints/MSDS/M0/seed_1/model_best.pt

@@ -9,12 +9,15 @@ cd "$ROOT_DIR" || exit 1
 
 PYTHON=${PYTHON:-python3}
 DEVICE=${DEVICE:-auto}
-EPOCHS=${EPOCHS:-15}
+EPOCHS=${EPOCHS:-100}
 BATCH_SIZE=${BATCH_SIZE:-128}
-VALIDATION_FRACTION=${VALIDATION_FRACTION:-0.1}
+MIN_EPOCHS=${MIN_EPOCHS:-5}
 PATIENCE=${PATIENCE:-3}
-MIN_DELTA=${MIN_DELTA:-1e-4}
-SEEDS=${SEEDS:-"1 2 3 4 5"}
+REL_DELTA=${REL_DELTA:-0.005}
+BASELINE_LOSS_RATIO=${BASELINE_LOSS_RATIO:-0.2}
+# 正式跑五折实验时可手动修改为 SEEDS=(1 2 3 4 5)
+# POSIX sh represents that list as the space-separated string below.
+SEEDS=${SEEDS:-"1"}
 DATASETS=${DATASETS:-"synthetic SMD SWaT SMAP MSL WADI MSDS UCR MBA NAB"}
 MODELS=${MODELS:-"M0 M1 M2 M3 M4"}
 RUNNER=experiments/run_progressive_ablation.py
@@ -58,8 +61,8 @@ for dataset in $DATASETS; do
 	fi
 done
 
-printf 'Device: %s | Epochs: %s | Batch size: %s | Validation: %s | Patience: %s | Min delta: %s\n' \
-	"$DEVICE" "$EPOCHS" "$BATCH_SIZE" "$VALIDATION_FRACTION" "$PATIENCE" "$MIN_DELTA"
+printf 'Device: %s | Max epochs: %s | Min epochs: %s | Batch size: %s | Patience: %s | Relative delta: %s | Baseline loss ratio: %s\n' \
+	"$DEVICE" "$EPOCHS" "$MIN_EPOCHS" "$BATCH_SIZE" "$PATIENCE" "$REL_DELTA" "$BASELINE_LOSS_RATIO"
 printf 'Seeds: %s\nDatasets: %s\nModels: %s\n' "$SEEDS" "$AVAILABLE_DATASETS" "$MODELS"
 
 for seed in $SEEDS; do
@@ -73,9 +76,10 @@ for seed in $SEEDS; do
 				--seed "$seed" \
 				--epochs "$EPOCHS" \
 				--batch-size "$BATCH_SIZE" \
-				--validation-fraction "$VALIDATION_FRACTION" \
+				--min-epochs "$MIN_EPOCHS" \
 				--patience "$PATIENCE" \
-				--min-delta "$MIN_DELTA" \
+				--rel-delta "$REL_DELTA" \
+				--baseline-loss-ratio "$BASELINE_LOSS_RATIO" \
 				--device "$DEVICE"
 			status=$?
 			if [ "$status" -ne 0 ]; then

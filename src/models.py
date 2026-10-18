@@ -522,7 +522,10 @@ class TranAD(nn.Module):
 		self.n = self.n_feats * self.n_window
 		self.pos_encoder = PositionalEncoding(2 * feats, 0.1, self.n_window)
 		encoder_layers = TransformerEncoderLayer(d_model=2 * feats, nhead=feats, dim_feedforward=16, dropout=0.1)
-		self.transformer_encoder = TransformerEncoder(encoder_layers, 1)
+		try:
+			self.transformer_encoder = TransformerEncoder(encoder_layers, 1, enable_nested_tensor=False)
+		except TypeError:  # Compatibility with older PyTorch releases.
+			self.transformer_encoder = TransformerEncoder(encoder_layers, 1)
 		decoder_layers1 = TransformerDecoderLayer(d_model=2 * feats, nhead=feats, dim_feedforward=16, dropout=0.1)
 		self.transformer_decoder1 = TransformerDecoder(decoder_layers1, 1)
 		decoder_layers2 = TransformerDecoderLayer(d_model=2 * feats, nhead=feats, dim_feedforward=16, dropout=0.1)

@@ -15,19 +15,15 @@ import torch.nn.functional as F
 
 
 ABLATION_VARIANTS = {f'M{i}' for i in range(5)}
-ACTIVE_VARIANCE_EPS = 1e-5
+ACTIVE_VARIANCE_EPS = 1e-4
 SCORE_EPS = 1e-8
 
 
 class MultiScaleCausalEmbedding(nn.Module):
 	"""Parallel causal depthwise-separable convolutions with LayerScale fusion."""
 
-	def __init__(self, channels):
+	def __init__(self, channels, initial_scale):
 		super().__init__()
-		self.input_projection = nn.Linear(channels, channels)
-		with torch.no_grad():
-			self.input_projection.weight.copy_(torch.eye(channels))
-			self.input_projection.bias.zero_()
 		self.depthwise = nn.ModuleList([
 			nn.Conv1d(channels, channels, kernel_size=k, groups=channels, bias=False)
 			for k in (1, 3, 5)
@@ -37,12 +33,10 @@ class MultiScaleCausalEmbedding(nn.Module):
 			for _ in (1, 3, 5)
 		])
 		self.output_projection = nn.Conv1d(3 * channels, channels, kernel_size=1)
-		self.layer_scale = nn.Parameter(torch.full((channels,), 1e-4))
-		self.layer_norm = nn.LayerNorm(channels)
+		self.layer_scale = nn.Parameter(torch.full((channels,), float(initial_scale)))
 
 	def forward(self, x):
 		# TranAD uses (time, batch, channels); Conv1d uses (batch, channels, time).
-		base = self.input_projection(x)
 		conv_input = x.permute(1, 2, 0)
 		features = []
 		for kernel, depthwise, pointwise in zip((1, 3, 5), self.depthwise, self.pointwise):
@@ -51,7 +45,25 @@ class MultiScaleCausalEmbedding(nn.Module):
 			features.append(pointwise(F.gelu(depthwise(causal_input))))
 		local = self.output_projection(torch.cat(features, dim=1)).permute(2, 0, 1)
 		scale = self.layer_scale.view(1, 1, -1)
-		return self.layer_norm(base + scale * local)
+		return x + scale * local
+
+
+class NormalPrototypeMemory(nn.Module):
+	"""Attention-addressed normal prototypes for encoder hidden states."""
+
+	def __init__(self, hidden_size, prototypes=16, initial_scale=0.1):
+		super().__init__()
+		self.hidden_size = hidden_size
+		self.prototypes = nn.Parameter(torch.randn(prototypes, hidden_size) * 0.02)
+		self.alpha = nn.Parameter(torch.tensor(float(initial_scale)))
+
+	def forward(self, hidden):
+		address = torch.softmax(
+			torch.matmul(hidden, self.prototypes.transpose(0, 1)) / math.sqrt(self.hidden_size),
+			dim=-1,
+		)
+		memory = torch.matmul(address, self.prototypes)
+		return hidden + self.alpha * memory
 
 
 class AdaptiveGatedGraphAttention(nn.Module):
@@ -167,47 +179,13 @@ def _amplitude_spectrum_loss(target, prediction):
 
 
 def progressive_reconstruction_loss(model, outputs, target, epoch):
-	"""Return the M3/M4 Huber, gated spectral, and trend training penalties."""
-	if getattr(model, 'variant_level', 0) < 3 or not isinstance(outputs, tuple):
-		zero = target.new_tensor(0.0)
-		return zero, {
-			'time_loss': 0.0,
-			'freq_loss': 0.0,
-			'freq_weight': 0.0,
-			'trend_loss': 0.0,
-		}
-	ordered_target = target.squeeze(0)
-	if ordered_target.shape[0] < 1:
-		zero = target.new_tensor(0.0)
-		return zero, {'time_loss': 0.0, 'freq_loss': 0.0, 'freq_weight': 0.0, 'trend_loss': 0.0}
+	"""Keep TranAD's two-stage objective unchanged for every ablation level.
 
-	phase_weight = 1.0 / max(1, epoch + 1)
-	weights = (phase_weight, 1.0 - phase_weight)
-	time_loss = target.new_tensor(0.0)
-	freq_loss = target.new_tensor(0.0)
-	trend_loss = target.new_tensor(0.0)
-	for weight, prediction in zip(weights, outputs):
-		ordered_prediction = prediction.squeeze(0)
-		time_loss = time_loss + weight * F.smooth_l1_loss(ordered_prediction, ordered_target)
-		freq_loss = freq_loss + weight * _amplitude_spectrum_loss(ordered_target, ordered_prediction)
-		if ordered_target.shape[0] > 1:
-			target_delta = ordered_target[1:] - ordered_target[:-1]
-			prediction_delta = ordered_prediction[1:] - ordered_prediction[:-1]
-			trend_loss = trend_loss + weight * F.l1_loss(prediction_delta, target_delta)
-
-	flatness = _spectral_flatness(ordered_target).to(device=target.device, dtype=target.dtype)
-	alpha_0 = getattr(model, 'freq_loss_weight', 0.1)
-	flatness_threshold = getattr(model, 'spectral_flatness_threshold', 0.3)
-	flatness_steepness = getattr(model, 'spectral_flatness_steepness', 10.0)
-	alpha_freq = alpha_0 * torch.sigmoid(flatness_steepness * (flatness_threshold - flatness))
-	beta = getattr(model, 'trend_loss_weight', 0.1)
-	extra_loss = time_loss + alpha_freq * freq_loss + beta * trend_loss
-	return extra_loss, {
-		'time_loss': float(time_loss.detach().cpu()),
-		'freq_loss': float(freq_loss.detach().cpu()),
-		'freq_weight': float(alpha_freq.detach().cpu()),
-		'trend_loss': float(trend_loss.detach().cpu()),
-	}
+	M3 and M4 add causal residual scoring after reconstruction. They do not add
+	new training penalties, which keeps M0's baseline objective intact.
+	"""
+	zero = target.new_tensor(0.0)
+	return zero, {'time_loss': 0.0, 'freq_loss': 0.0, 'freq_weight': 0.0, 'trend_loss': 0.0}
 
 
 def adaptive_topk_scores(residuals):
@@ -230,44 +208,136 @@ def adaptive_topk_scores(residuals):
 	return scores, ks
 
 
-def kurtosis_gated_normalized_aggregation(train_residuals, test_residuals, topk=3, epsilon=SCORE_EPS):
-	"""Standardize residual channels on train data and blend mean/top-k by kurtosis."""
+def causal_persistence_filter(residuals, beta=0.35, median_window=5, mad_scale=3.0):
+	"""EMA smooth residuals and gate isolated spikes against a causal median."""
+	values = np.asarray(residuals, dtype=np.float64)
+	if values.ndim != 2:
+		raise ValueError('Residual filtering expects a [time, channels] matrix.')
+	if not 0.0 <= beta < 1.0:
+		raise ValueError('EMA beta must be in [0, 1).')
+	if median_window < 1:
+		raise ValueError('The causal median window must be positive.')
+	if values.shape[0] == 0:
+		return values.copy()
+	ema = np.empty_like(values)
+	filtered = np.empty_like(values)
+	ema[0] = values[0]
+	filtered[0] = values[0]
+	for index in range(1, values.shape[0]):
+		ema[index] = (1.0 - beta) * values[index] + beta * ema[index - 1]
+		start = max(0, index - median_window + 1)
+		local = values[start:index + 1]
+		median = np.median(local, axis=0)
+		mad = np.median(np.abs(local - median[None, :]), axis=0) * 1.4826
+		departure = np.abs(values[index] - median)
+		gate = np.clip((departure - mad_scale * mad) / np.maximum(departure, SCORE_EPS), 0.0, 1.0)
+		filtered[index] = (1.0 - gate) * ema[index] + gate * median
+	return filtered
+
+
+def causal_horizon_shift_scores(windows, train_mean, train_std, decay=0.995, active_epsilon=1e-4):
+	"""Score local/slow-horizon shifts against the normal training baseline."""
+	values = windows.detach().cpu().numpy() if torch.is_tensor(windows) else np.asarray(windows)
+	values = np.asarray(values, dtype=np.float64)
+	if values.ndim != 3:
+		raise ValueError('Horizon shift scoring expects [time, window, channels] data.')
+	train_mean = np.asarray(train_mean, dtype=np.float64).reshape(-1)
+	train_std = np.asarray(train_std, dtype=np.float64).reshape(-1)
+	if values.shape[2] != train_mean.size or train_mean.size != train_std.size:
+		raise ValueError('Training statistics do not match the window feature count.')
+	local_mean = values.mean(axis=1)
+	slow_baseline = np.empty_like(local_mean)
+	baseline = train_mean.copy()
+	for index, current in enumerate(local_mean):
+		baseline = decay * baseline + (1.0 - decay) * current
+		slow_baseline[index] = baseline
+	deviation = np.maximum(np.abs(local_mean - train_mean), np.abs(local_mean - slow_baseline))
+	active = train_std > active_epsilon
+	excess = np.maximum(deviation - 2.0 * train_std, 0.0)
+	shift = excess ** 2
+	shift[:, ~active] = 0.0
+	return shift
+
+
+def iqr_calibration_floor(train_residuals, reference_values, noise_scale=0.05):
+	"""Protect POT calibration from collapsed clean-train residuals."""
+	residuals = np.asarray(train_residuals, dtype=np.float64)
+	reference = np.asarray(reference_values, dtype=np.float64)
+	if residuals.ndim != 2 or reference.ndim != 2:
+		raise ValueError('IQR calibration expects [time, channels] matrices.')
+	if residuals.shape[1] != reference.shape[1]:
+		raise ValueError('Calibration residuals and reference data must have the same channel count.')
+	if residuals.shape[0] == 0:
+		return residuals.copy(), np.zeros(residuals.shape[1], dtype=np.float64)
+	q25, q75 = np.quantile(residuals, (0.25, 0.75), axis=0)
+	# Use Tukey's lower fence as a robust lower bound. Adding a positive IQR
+	# fraction here would shift the whole POT reference distribution and can
+	# change a previously calibrated M0 threshold even when there is no collapse.
+	iqr = np.maximum(q75 - q25, 0.0)
+	robust_floor = q25 - 1.5 * iqr
+	noise_floor = (noise_scale * np.std(reference, axis=0)) ** 2
+	finite_scale = np.maximum(np.max(np.abs(residuals), axis=0), 1.0)
+	floor = np.maximum.reduce((robust_floor, noise_floor, np.finfo(np.float64).eps * finite_scale))
+	return np.maximum(residuals, floor[None, :]), floor
+
+
+def _topk_channel_mean(residuals, k):
+	values = np.asarray(residuals, dtype=np.float64)
+	features = values.shape[1]
+	k = min(max(int(k), 1), features)
+	if k == features:
+		return np.mean(values, axis=1)
+	selected = np.partition(values, features - k, axis=1)[:, features - k:]
+	return np.mean(selected, axis=1)
+
+
+def monotonic_guarded_topk_aggregation(train_residuals, test_residuals, quantile=0.99):
+	"""Choose sparse raw-residual Top-K only when its POT tail margin beats mean.
+
+	The gate is selected without test labels. It protects the M3 mean score as
+	the fallback, while making no claim that an unlabeled margin guarantees a
+	classification-metric improvement.
+	"""
 	train = np.asarray(train_residuals, dtype=np.float64)
 	test = np.asarray(test_residuals, dtype=np.float64)
 	if train.ndim != 2 or test.ndim != 2:
-		raise ValueError('Kurtosis-gated aggregation expects [time, channels] matrices.')
-	if train.shape[1] != test.shape[1]:
-		raise ValueError('Train and test residuals must have the same channel count.')
-	if train.shape[1] == 0:
-		raise ValueError('Kurtosis-gated aggregation requires at least one channel.')
+		raise ValueError('Top-k aggregation expects [time, channels] residual matrices.')
+	if train.shape[1] != test.shape[1] or train.shape[1] == 0:
+		raise ValueError('Train and test residuals must have the same non-zero feature count.')
 	if train.shape[0] == 0 or test.shape[0] == 0:
-		raise ValueError('Kurtosis-gated aggregation requires non-empty train and test residuals.')
+		raise ValueError('Top-k aggregation requires non-empty train and test residuals.')
+	if not np.isfinite(train).all() or not np.isfinite(test).all():
+		raise ValueError('Top-k aggregation requires finite residuals.')
+	features = train.shape[1]
+	from src.pot import pot_eval
 
-	mean = np.mean(train, axis=0, dtype=np.float64)
-	std = np.std(train, axis=0, dtype=np.float64)
-	denominator = std + epsilon
-	train_z = (train - mean) / denominator
-	test_z = (test - mean) / denominator
-	k = min(max(int(topk), 1), train.shape[1])
+	def candidate(k):
+		train_score = _topk_channel_mean(train, k)
+		test_score = _topk_channel_mean(test, k)
+		threshold_result, _ = pot_eval(train_score, test_score, np.zeros(test_score.shape[0], dtype=np.int8))
+		threshold = float(threshold_result['threshold'])
+		tail = float(np.quantile(test_score, quantile))
+		spread = float(np.quantile(train_score, 0.75) - np.quantile(train_score, 0.25))
+		margin = (tail - threshold) / max(spread, SCORE_EPS)
+		return train_score, test_score, threshold, margin
 
-	def aggregate(z):
-		row_mean = np.mean(z, axis=1)
-		centered = z - row_mean[:, None]
-		variance = np.mean(centered ** 2, axis=1)
-		fourth_moment = np.mean(centered ** 4, axis=1)
-		kurtosis = np.zeros_like(variance)
-		valid = variance > epsilon
-		kurtosis[valid] = fourth_moment[valid] / (variance[valid] ** 2) - 3.0
-		# Center the sigmoid at zero excess kurtosis: plain sigmoid(0)=0.5 would
-		# retain a half-strength top-k term on Gaussian background residuals.
-		sigmoid = 1.0 / (1.0 + np.exp(-np.clip(kurtosis, -60.0, 60.0)))
-		gate = np.maximum(2.0 * sigmoid - 1.0, 0.0)
-		largest = np.partition(z, z.shape[1] - k, axis=1)[:, -k:]
-		topk_mean = np.mean(largest, axis=1)
-		score = (1.0 - gate) * row_mean + gate * topk_mean
-		return score
+	baseline = candidate(features)
+	selected_k = features
+	selected = baseline
+	for k in range(1, features):
+		current = candidate(k)
+		if current[3] > selected[3] + 1e-12:
+			selected_k = k
+			selected = current
+	return selected[0], selected[1], selected_k, baseline[3], selected[3]
 
-	return aggregate(train_z), aggregate(test_z), k
+
+def kurtosis_gated_normalized_aggregation(train_residuals, test_residuals, topk=3, epsilon=SCORE_EPS):
+	"""Backward-compatible alias for the unnormalized guarded Top-K scorer."""
+	train_score, test_score, selected_k, _, _ = monotonic_guarded_topk_aggregation(
+		train_residuals, test_residuals
+	)
+	return train_score, test_score, selected_k
 
 
 def make_tranad_ablation_class(variant):
@@ -282,13 +352,11 @@ def make_tranad_ablation_class(variant):
 			self.name = f'TranAD_{variant}'
 			self.variant = variant
 			self.variant_level = int(variant[1])
-			self.freq_loss_weight = 0.1
-			self.spectral_flatness_threshold = 0.3
-			self.spectral_flatness_steepness = 10.0
-			self.trend_loss_weight = 0.1
-			self.causal_embedding = MultiScaleCausalEmbedding(2 * feats) if self.variant_level >= 1 else None
+			conv_scale = 0.02 if feats == 1 else 0.1
+			self.causal_embedding = MultiScaleCausalEmbedding(2 * feats, conv_scale) if self.variant_level >= 1 else None
 			self.graph_attention = AdaptiveGatedGraphAttention(feats) if self.variant_level >= 2 else None
-			self.uses_kurtosis_aggregation = self.variant_level >= 4
+			self.prototype_memory = NormalPrototypeMemory(2 * feats) if self.variant_level >= 2 else None
+			self.uses_monotonic_topk = self.variant_level >= 4
 
 		def encode(self, src, c, tgt):
 			if self.variant_level == 0:
@@ -302,6 +370,8 @@ def make_tranad_ablation_class(variant):
 			src = src * math.sqrt(self.n_feats)
 			src = self.pos_encoder(src)
 			memory = self.transformer_encoder(src)
+			if self.prototype_memory is not None:
+				memory = self.prototype_memory(memory)
 			tgt = tgt.repeat(1, 1, 2)
 			return tgt, memory
 

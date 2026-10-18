@@ -247,25 +247,29 @@ def train_one_epoch(model, train_windows, optimizer, scheduler, epoch, batch_siz
 	}
 
 
-def validation_reconstruction_loss(model, validation_windows, batch_size, epoch):
-	"""Compute ordered-window TranAD reconstruction MSE without using labels."""
+def validation_reconstruction_loss(model, validation_windows, batch_size, epoch, noise_std=0.0, seed=0):
+	"""Measure fixed-noise denoising loss over every supplied training window."""
 	model.eval()
 	criterion = nn.MSELoss(reduction='none')
 	feats = validation_windows.shape[-1]
 	weighted_loss = 0.0
 	n_samples = 0
+	generator = torch.Generator(device='cpu').manual_seed(int(seed))
 	with torch.no_grad():
 		for start_index in range(0, validation_windows.shape[0], batch_size):
-			batch = validation_windows[start_index:start_index + batch_size]
-			local_bs = batch.shape[0]
-			window = batch.permute(1, 0, 2)
-			elem = window[-1, :, :].view(1, local_bs, feats)
-			output = model(window, elem)
+			clean = validation_windows[start_index:start_index + batch_size]
+			local_bs = clean.shape[0]
+			noise = torch.randn(clean.shape, generator=generator, dtype=torch.float32)
+			noisy = clean + noise.to(device=clean.device, dtype=clean.dtype) * float(noise_std)
+			window = noisy.permute(1, 0, 2)
+			decoder_input = noisy[:, -1, :].view(1, local_bs, feats)
+			clean_target = clean[:, -1, :].view(1, local_bs, feats)
+			output = model(window, decoder_input)
 			if isinstance(output, tuple):
 				n = epoch + 1
-				loss_terms = (1 / n) * criterion(output[0], elem) + (1 - 1 / n) * criterion(output[1], elem)
+				loss_terms = (1 / n) * criterion(output[0], clean_target) + (1 - 1 / n) * criterion(output[1], clean_target)
 			else:
-				loss_terms = criterion(output, elem)
+				loss_terms = criterion(output, clean_target)
 			weighted_loss += float(loss_terms.mean().cpu()) * local_bs
 			n_samples += local_bs
 	if n_samples == 0:
@@ -515,6 +519,31 @@ def predict_dagmm(model, windows, batch_size=None):
 	return final_loss.detach().cpu().numpy(), final_pred.detach().cpu().numpy()
 
 
+def _prepare_tranad_score_calibration(model, train_windows, test_windows, train_loss, test_loss):
+	"""Apply the requested M3 score transforms and protect POT's init scores."""
+	from src.tranad_progressive import (
+		causal_horizon_shift_scores,
+		causal_persistence_filter,
+		iqr_calibration_floor,
+	)
+
+	train_reference = train_windows[:, -1, :].detach().cpu().numpy()
+	train_mean = np.mean(train_reference, axis=0)
+	train_std = np.std(train_reference, axis=0)
+	variant_level = int(getattr(model, 'variant_level', 0))
+	if variant_level >= 3:
+		train_loss = causal_persistence_filter(train_loss, beta=0.35)
+		test_loss = causal_persistence_filter(test_loss, beta=0.35)
+		train_loss = train_loss + 0.05 * causal_horizon_shift_scores(
+			train_windows, train_mean, train_std, decay=0.995
+		)
+		test_loss = test_loss + 0.05 * causal_horizon_shift_scores(
+			test_windows, train_mean, train_std, decay=0.995
+		)
+	train_loss, score_floor = iqr_calibration_floor(train_loss, train_reference, noise_scale=0.05)
+	return train_loss, test_loss, score_floor
+
+
 def predict_usad(model, windows, batch_size=None):
 	model.eval()
 	criterion = nn.MSELoss(reduction='none')
@@ -678,11 +707,14 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		results.append(result)
 	per_dim = pd.DataFrame(results)
 	selected_topk = None
-	if score_agg == 'kurtosis_gated':
-		from src.tranad_progressive import kurtosis_gated_normalized_aggregation
-		train_final, test_final, selected_topk = kurtosis_gated_normalized_aggregation(
-			train_loss, test_loss, topk=topk
+	guard_margin_gain = None
+	mean_margin = None
+	if score_agg in {'monotonic_topk', 'kurtosis_gated'}:
+		from src.tranad_progressive import monotonic_guarded_topk_aggregation
+		train_final, test_final, selected_topk, mean_margin, selected_margin = monotonic_guarded_topk_aggregation(
+			train_loss, test_loss
 		)
+		guard_margin_gain = selected_margin - mean_margin
 		final_result, final_pred = pot_eval(train_final, test_final, (np.sum(labels, axis=1) >= 1) + 0)
 	elif score_agg == 'adaptive_topk':
 		from src.tranad_progressive import adaptive_topk_scores
@@ -704,12 +736,14 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		'recall': final_result['recall'],
 		'roc_auc': final_result['ROC/AUC'],
 		'threshold': final_result['threshold'],
-		'score_agg': score_agg,
-		'score_topk': (_fixed_topk(topk, test_loss.shape[1]) if score_agg == 'kurtosis_gated' else
+		'score_agg': ('monotonic_topk' if score_agg == 'kurtosis_gated' else score_agg),
+		'score_topk': (_fixed_topk(selected_topk, test_loss.shape[1]) if score_agg in {'kurtosis_gated', 'monotonic_topk'} else
 			'adaptive' if score_agg == 'adaptive_topk' else
 			'auto' if is_auto_topk(topk) else
 			(_fixed_topk(topk, test_loss.shape[1]) if score_agg == 'topk' else None)),
 		'selected_topk': selected_topk,
+		'm4_mean_tail_margin': mean_margin,
+		'm4_selected_tail_margin_gain': guard_margin_gain,
 		'train_score_mean': float(np.mean(train_final)),
 		'train_score_std': float(np.std(train_final)),
 		'test_score_mean': float(np.mean(test_final)),
@@ -725,9 +759,14 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 def evaluate_tranad(model, train_windows, test_windows, labels, batch_size, show_progress=False, score_agg='mean', topk=3):
 	train_loss, _ = predict_tranad(model, train_windows, batch_size)
 	test_loss, y_pred = predict_tranad(model, test_windows, batch_size)
+	train_loss, test_loss, score_floor = _prepare_tranad_score_calibration(
+		model, train_windows, test_windows, train_loss, test_loss
+	)
 	metrics, per_dim, _, _, _ = evaluate_loss_arrays(
 		train_loss, test_loss, labels, show_progress=show_progress, score_agg=score_agg, topk=topk
 	)
+	metrics['score_calibration'] = 'causal_ema_shift_iqr_noise_floor' if getattr(model, 'variant_level', 0) >= 3 else 'iqr_noise_floor'
+	metrics['init_score_floor_mean'] = float(np.mean(score_floor)) if score_floor.size else 0.0
 	return metrics, per_dim, y_pred, test_loss
 
 
