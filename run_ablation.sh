@@ -42,11 +42,22 @@ dataset_raw_dir() {
 	esac
 }
 
+msds_labels_available() {
+	"$PYTHON" -c 'import sys; from preprocess import msds_has_positive_labels; sys.exit(0 if msds_has_positive_labels() else 1)' >/dev/null 2>&1
+}
+
 dataset_available() {
 	dataset=$1
 	prefix=$(dataset_prefix "$dataset")
 	folder="processed/$dataset"
 	raw_folder=$(dataset_raw_dir "$dataset")
+	if [ "$dataset" = MSDS ]; then
+		[ -f "$raw_folder/train.csv" ] &&
+		[ -f "$raw_folder/test.csv" ] &&
+		[ -f "$raw_folder/labels.csv" ] &&
+		msds_labels_available
+		return $?
+	fi
 	[ -d "$raw_folder" ] &&
 	[ -f "$folder/${prefix}train.npy" ] &&
 	[ -f "$folder/${prefix}test.npy" ] &&

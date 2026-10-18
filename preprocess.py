@@ -10,6 +10,84 @@ from shutil import copyfile
 datasets = ['synthetic', 'SMD', 'SWaT', 'SMAP', 'MSL', 'WADI', 'MSDS', 'UCR', 'MBA', 'NAB']
 wadi_drop = ['2_LS_001_AL', '2_LS_002_AL','2_P_001_STATUS','2_P_002_STATUS']
 
+
+class MSDSLabelsUnavailable(ValueError):
+	"""Raised when the local MSDS source has no usable anomaly annotations."""
+
+
+def _is_index_or_time_column(series, name):
+	name = str(name).strip().lower()
+	if not name or name.startswith('unnamed:') or name in {
+		'index', 'timestamp', 'time', 'date', 'datetime', 'row', 'row_id', 'id', 'step', 'sequence'
+	}:
+		return True
+	values = series.dropna()
+	if values.empty:
+		return True
+	if pd.api.types.is_numeric_dtype(values):
+		return False
+	return pd.to_datetime(values, errors='coerce').notna().mean() > 0.9
+
+
+def msds_has_positive_labels(labels_path=None):
+	"""Return whether the raw MSDS label CSV contains any positive annotation."""
+	labels_path = labels_path or os.path.join(data_folder, 'MSDS', 'labels.csv')
+	if not os.path.isfile(labels_path):
+		return False
+	frame = pd.read_csv(labels_path)
+	if frame.empty:
+		return False
+	columns = [column for column in frame.columns if not _is_index_or_time_column(frame[column], column)]
+	if not columns:
+		return False
+	values = frame[columns].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=np.float64)
+	return bool(
+		np.isfinite(values).any()
+		and np.any(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0) > 0.1)
+	)
+
+
+def _read_msds_labels(labels_path, n_rows, n_features):
+	frame = pd.read_csv(labels_path)
+	columns = [column for column in frame.columns if not _is_index_or_time_column(frame[column], column)]
+	if not columns:
+		raise MSDSLabelsUnavailable(f'MSDS labels contain no annotation columns: {labels_path}')
+	values = frame[columns].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+	if not np.any(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0) > 0.1):
+		raise MSDSLabelsUnavailable(
+			f'MSDS source labels contain no positive anomaly annotations: {labels_path}'
+		)
+	return align_msds_label_array(values, n_rows, n_features)
+
+
+def align_msds_label_array(values, n_rows, n_features):
+	values = np.asarray(values, dtype=np.float64)
+	if values.ndim == 1:
+		values = values[:, None]
+	if values.ndim != 2:
+		raise ValueError(f'MSDS labels must be a 1D or 2D array, got {values.shape}.')
+	values = (np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0) > 0.1).astype(np.float64)
+	# Keep per-channel labels when they match signal dimensions. Otherwise,
+	# treat them as global event labels and broadcast their logical OR.
+	if values.shape[1] == 1:
+		values = np.repeat(values, n_features, axis=1)
+	elif values.shape[1] != n_features:
+		values = np.repeat(np.any(values > 0.1, axis=1, keepdims=True), n_features, axis=1).astype(np.float64)
+
+	# Max-pool source intervals so short anomalies survive downsampling.
+	if values.shape[0] != n_rows:
+		if n_rows <= 0 or values.shape[0] < n_rows:
+			raise ValueError(
+				f'MSDS labels have {values.shape[0]} rows but test data has {n_rows}; '
+				'cannot align labels safely.'
+			)
+		boundaries = np.floor(np.linspace(0, values.shape[0], n_rows + 1)).astype(np.int64)
+		aligned = np.zeros((n_rows, n_features), dtype=np.float64)
+		for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+			aligned[index] = np.max(values[start:max(start + 1, end)], axis=0)
+		values = aligned
+	return values
+
 def load_and_save(category, filename, dataset, dataset_folder):
     temp = np.genfromtxt(os.path.join(dataset_folder, category, filename),
                          dtype=np.float64,
@@ -114,17 +192,36 @@ def load_data(dataset):
 				np.save(os.path.join(folder, f'{fn}_{file}.npy'), eval(file))
 	elif dataset == 'MSDS':
 		dataset_folder = 'data/MSDS'
-		df_train = pd.read_csv(os.path.join(dataset_folder, 'train.csv'))
-		df_test  = pd.read_csv(os.path.join(dataset_folder, 'test.csv'))
-		df_train, df_test = df_train.values[::5, 1:], df_test.values[::5, 1:]
-		_, min_a, max_a = normalize3(np.concatenate((df_train, df_test), axis=0))
-		train, _, _ = normalize3(df_train, min_a, max_a)
-		test, _, _ = normalize3(df_test, min_a, max_a)
-		labels = pd.read_csv(os.path.join(dataset_folder, 'labels.csv'))
-		# Keep labels aligned with the same 5x sampling used for train/test.
-		labels = labels.values[::5, 1:]
-		for file in ['train', 'test', 'labels']:
-			np.save(os.path.join(folder, f'{file}.npy'), eval(file).astype('float64'))
+		train_frame = pd.read_csv(os.path.join(dataset_folder, 'train.csv'))
+		test_frame = pd.read_csv(os.path.join(dataset_folder, 'test.csv'))
+		train_columns = [
+			column for column in train_frame.columns
+			if not _is_index_or_time_column(train_frame[column], column)
+		]
+		test_columns = [
+			column for column in test_frame.columns
+			if not _is_index_or_time_column(test_frame[column], column)
+		]
+		if train_columns != test_columns or not train_columns:
+			raise ValueError(
+				'MSDS train and test CSVs must contain the same non-index feature columns.'
+			)
+		train_source = train_frame[train_columns].apply(pd.to_numeric, errors='raise').to_numpy(dtype=np.float64)
+		test_source = test_frame[test_columns].apply(pd.to_numeric, errors='raise').to_numpy(dtype=np.float64)
+		train_source, test_source = train_source[::5], test_source[::5]
+		labels = _read_msds_labels(
+			os.path.join(dataset_folder, 'labels.csv'), len(test_source), test_source.shape[1]
+		)
+		_, min_a, max_a = normalize3(np.concatenate((train_source, test_source), axis=0))
+		train, _, _ = normalize3(train_source, min_a, max_a)
+		test, _, _ = normalize3(test_source, min_a, max_a)
+		# Write all three arrays through temporary files only after labels have
+		# passed validation; stale all-zero caches are never rewritten as truth.
+		for name, values in (('train', train), ('test', test), ('labels', labels)):
+			path = os.path.join(folder, f'{name}.npy')
+			temporary = path + '.tmp.npy'
+			np.save(temporary, np.asarray(values, dtype=np.float64))
+			os.replace(temporary, path)
 	elif dataset == 'SWaT':
 		dataset_folder = 'data/SWaT'
 		file = os.path.join(dataset_folder, 'series.json')

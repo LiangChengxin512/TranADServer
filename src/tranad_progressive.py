@@ -119,65 +119,6 @@ class AdaptiveGatedGraphAttention(nn.Module):
 		return torch.where(active.unsqueeze(0), updated, x)
 
 
-def _rfft_pair(target, prediction):
-	"""Compute a matched FFT pair, falling back to CPU when MPS lacks rFFT."""
-	device = target.device
-	try:
-		return torch.fft.rfft(target, dim=0), torch.fft.rfft(prediction, dim=0), device
-	except (RuntimeError, NotImplementedError):
-		if device.type != 'mps':
-			raise
-		target_cpu, prediction_cpu = target.to('cpu'), prediction.to('cpu')
-		return torch.fft.rfft(target_cpu, dim=0), torch.fft.rfft(prediction_cpu, dim=0), device
-
-
-def _spectral_flatness(target):
-	"""Measure broadband content in values and first differences per channel.
-
-	The maximum keeps an isolated step edge broadband even though the raw step
-	can have low spectral flatness, while a periodic waveform stays narrowband
-	in both representations. Constant channels are excluded from the average.
-	"""
-	if target.shape[0] < 8:
-		return target.new_tensor(1.0)
-	device = target.device
-
-	def per_channel_flatness(signal):
-		centered = signal - signal.mean(dim=0, keepdim=True)
-		try:
-			power = torch.fft.rfft(centered, dim=0).abs().square()
-		except (RuntimeError, NotImplementedError):
-			if device.type != 'mps':
-				raise
-			power = torch.fft.rfft(centered.to('cpu'), dim=0).abs().square()
-		# DC level and offset are not periodic structure.
-		if power.shape[0] > 1:
-			power = power[1:]
-		mean_power = power.mean(dim=0)
-		log_geometric_mean = torch.log(power.clamp_min(SCORE_EPS)).mean(dim=0)
-		return (torch.exp(log_geometric_mean) / mean_power.clamp_min(SCORE_EPS)).clamp(0.0, 1.0).to(device=device)
-
-	first_difference = target[1:] - target[:-1]
-	value_flatness = per_channel_flatness(target)
-	difference_flatness = per_channel_flatness(first_difference)
-	active = target.var(dim=0, unbiased=False) > SCORE_EPS
-	if not bool(active.any().item()):
-		return target.new_tensor(1.0)
-	flatness = torch.maximum(value_flatness, difference_flatness).to(device=device)
-	return flatness[active].mean().clamp(0.0, 1.0)
-
-
-def _amplitude_spectrum_loss(target, prediction):
-	"""Mean-channel L1 rFFT amplitude difference, normalized by time length."""
-	if target.shape[0] < 2:
-		return prediction.sum() * 0.0
-	target_spectrum, prediction_spectrum, device = _rfft_pair(target, prediction)
-	target_amplitude = target_spectrum.abs()
-	prediction_amplitude = prediction_spectrum.abs()
-	loss = (target_amplitude - prediction_amplitude).abs().sum(dim=0).mean() / target.shape[0]
-	return loss.to(device=device)
-
-
 def progressive_reconstruction_loss(model, outputs, target, epoch):
 	"""Keep TranAD's two-stage objective unchanged for every ablation level.
 
@@ -208,77 +149,114 @@ def adaptive_topk_scores(residuals):
 	return scores, ks
 
 
-def causal_persistence_filter(residuals, beta=0.35, median_window=5, mad_scale=3.0):
-	"""EMA smooth residuals and gate isolated spikes against a causal median."""
+def phase_concordant_residuals(phase1_residuals, phase2_residuals, lower=0.85, upper=1.25):
+	"""Sharpen phase-two absolute error using its instantaneous phase ratio."""
+	phase1 = np.asarray(phase1_residuals, dtype=np.float64)
+	phase2 = np.asarray(phase2_residuals, dtype=np.float64)
+	if phase1.shape != phase2.shape or phase1.ndim != 2:
+		raise ValueError('Phase residuals must have matching [time, channels] shapes.')
+	if not 0.0 < lower <= upper:
+		raise ValueError('Concordance ratio bounds must satisfy 0 < lower <= upper.')
+	ratio = (phase2 + SCORE_EPS) / (phase1 + SCORE_EPS)
+	return phase2 * np.clip(ratio, lower, upper)
+
+
+def zero_smearing_spike_filter(residuals, shrinkage=0.25, isolation_ratio=1.5):
+	"""Shrink only isolated high points using a trailing three-point second max.
+
+	The output at time t depends only on t and its two predecessors, so a high
+	point never alters any later score. Two-point-or-shorter inputs pass through.
+	"""
 	values = np.asarray(residuals, dtype=np.float64)
 	if values.ndim != 2:
-		raise ValueError('Residual filtering expects a [time, channels] matrix.')
-	if not 0.0 <= beta < 1.0:
-		raise ValueError('EMA beta must be in [0, 1).')
-	if median_window < 1:
-		raise ValueError('The causal median window must be positive.')
-	if values.shape[0] == 0:
-		return values.copy()
-	ema = np.empty_like(values)
-	filtered = np.empty_like(values)
-	ema[0] = values[0]
-	filtered[0] = values[0]
-	for index in range(1, values.shape[0]):
-		ema[index] = (1.0 - beta) * values[index] + beta * ema[index - 1]
-		start = max(0, index - median_window + 1)
-		local = values[start:index + 1]
-		median = np.median(local, axis=0)
-		mad = np.median(np.abs(local - median[None, :]), axis=0) * 1.4826
-		departure = np.abs(values[index] - median)
-		gate = np.clip((departure - mad_scale * mad) / np.maximum(departure, SCORE_EPS), 0.0, 1.0)
-		filtered[index] = (1.0 - gate) * ema[index] + gate * median
+		raise ValueError('Spike filtering expects a [time, channels] matrix.')
+	if not 0.0 <= shrinkage <= 1.0 or isolation_ratio <= 1.0:
+		raise ValueError('Use shrinkage in [0, 1] and an isolation ratio above 1.')
+	filtered = values.copy()
+	for index in range(2, values.shape[0]):
+		second = np.maximum(values[index - 1], values[index - 2])
+		isolated = values[index] > isolation_ratio * np.maximum(second, SCORE_EPS)
+		filtered[index, isolated] = (
+			(1.0 - shrinkage) * values[index, isolated]
+			+ shrinkage * second[isolated]
+		)
 	return filtered
 
 
-def causal_horizon_shift_scores(windows, train_mean, train_std, decay=0.995, active_epsilon=1e-4):
-	"""Score local/slow-horizon shifts against the normal training baseline."""
-	values = windows.detach().cpu().numpy() if torch.is_tensor(windows) else np.asarray(windows)
-	values = np.asarray(values, dtype=np.float64)
-	if values.ndim != 3:
-		raise ValueError('Horizon shift scoring expects [time, window, channels] data.')
-	train_mean = np.asarray(train_mean, dtype=np.float64).reshape(-1)
-	train_std = np.asarray(train_std, dtype=np.float64).reshape(-1)
-	if values.shape[2] != train_mean.size or train_mean.size != train_std.size:
-		raise ValueError('Training statistics do not match the window feature count.')
-	local_mean = values.mean(axis=1)
-	slow_baseline = np.empty_like(local_mean)
-	baseline = train_mean.copy()
-	for index, current in enumerate(local_mean):
-		baseline = decay * baseline + (1.0 - decay) * current
-		slow_baseline[index] = baseline
-	deviation = np.maximum(np.abs(local_mean - train_mean), np.abs(local_mean - slow_baseline))
-	active = train_std > active_epsilon
-	excess = np.maximum(deviation - 2.0 * train_std, 0.0)
-	shift = excess ** 2
-	shift[:, ~active] = 0.0
-	return shift
+def anchor_residual_scale(residuals, reference, best_epoch, anchor_epoch=5):
+	"""Restore init-score scale toward epoch five when a later checkpoint shrinks it."""
+	values = np.asarray(residuals, dtype=np.float64)
+	if values.ndim != 2:
+		raise ValueError('Residual scale anchoring expects [time, channels] values.')
+	if reference is None or int(best_epoch or 0) <= anchor_epoch:
+		return values.copy(), False
+	ref_mean = np.asarray(reference.get('mean', []), dtype=np.float64).reshape(-1)
+	ref_std = np.asarray(reference.get('std', []), dtype=np.float64).reshape(-1)
+	if ref_mean.size != values.shape[1] or ref_std.size != values.shape[1]:
+		return values.copy(), False
+	best_mean = np.mean(values, axis=0)
+	best_std = np.std(values, axis=0)
+	anchored = ref_mean[None, :] + (ref_std / (best_std + SCORE_EPS))[None, :] * (
+		values - best_mean[None, :]
+	)
+	anchored = np.nan_to_num(anchored, nan=0.0, posinf=np.finfo(np.float64).max, neginf=0.0)
+	return np.maximum(values, anchored), True
 
 
-def iqr_calibration_floor(train_residuals, reference_values, noise_scale=0.05):
-	"""Protect POT calibration from collapsed clean-train residuals."""
-	residuals = np.asarray(train_residuals, dtype=np.float64)
-	reference = np.asarray(reference_values, dtype=np.float64)
-	if residuals.ndim != 2 or reference.ndim != 2:
-		raise ValueError('IQR calibration expects [time, channels] matrices.')
-	if residuals.shape[1] != reference.shape[1]:
-		raise ValueError('Calibration residuals and reference data must have the same channel count.')
-	if residuals.shape[0] == 0:
-		return residuals.copy(), np.zeros(residuals.shape[1], dtype=np.float64)
-	q25, q75 = np.quantile(residuals, (0.25, 0.75), axis=0)
-	# Use Tukey's lower fence as a robust lower bound. Adding a positive IQR
-	# fraction here would shift the whole POT reference distribution and can
-	# change a previously calibrated M0 threshold even when there is no collapse.
-	iqr = np.maximum(q75 - q25, 0.0)
-	robust_floor = q25 - 1.5 * iqr
-	noise_floor = (noise_scale * np.std(reference, axis=0)) ** 2
-	finite_scale = np.maximum(np.max(np.abs(residuals), axis=0), 1.0)
-	floor = np.maximum.reduce((robust_floor, noise_floor, np.finfo(np.float64).eps * finite_scale))
-	return np.maximum(residuals, floor[None, :]), floor
+def _pot_tail_profile(calibration_score, validation_score, quantile=0.99):
+	"""Return unlabeled POT tail margin and validation exceedance rate."""
+	from src.pot import pot_eval
+	calibration_score = np.asarray(calibration_score, dtype=np.float64).reshape(-1)
+	validation_score = np.asarray(validation_score, dtype=np.float64).reshape(-1)
+	result, _ = pot_eval(
+		calibration_score,
+		validation_score,
+		np.zeros(validation_score.size, dtype=np.int8),
+	)
+	threshold = float(result['threshold'])
+	if not np.isfinite(threshold):
+		return float('-inf'), float('inf')
+	tail = float(np.quantile(validation_score, quantile))
+	spread = float(np.quantile(calibration_score, 0.75) - np.quantile(calibration_score, 0.25))
+	margin = (tail - threshold) / max(spread, SCORE_EPS)
+	exceedance = float(np.mean(validation_score > threshold))
+	return margin, exceedance
+
+
+def phase_concordance_guard(candidate_residuals, baseline_residuals, quantile=0.99):
+	"""Enable M3 sharpening only when a held-out train tail supports it."""
+	candidate = np.asarray(candidate_residuals, dtype=np.float64)
+	baseline = np.asarray(baseline_residuals, dtype=np.float64)
+	if candidate.shape != baseline.shape or candidate.ndim != 2:
+		raise ValueError('M3 candidate and baseline residuals must have matching 2D shapes.')
+	if candidate.shape[0] < 10 or candidate.shape[1] == 0:
+		return False, 0.0
+	split = max(1, min(candidate.shape[0] - 1, int(np.floor(candidate.shape[0] * 0.8))))
+	base_profile = _pot_tail_profile(
+		baseline[:split].mean(axis=1), baseline[split:].mean(axis=1), quantile
+	)
+	candidate_profile = _pot_tail_profile(
+		candidate[:split].mean(axis=1), candidate[split:].mean(axis=1), quantile
+	)
+	margin_gain = candidate_profile[0] - base_profile[0]
+	meaningful_gain = max(0.05, abs(base_profile[0]) * 0.1)
+	use_candidate = (
+		np.isfinite(margin_gain)
+		and margin_gain > meaningful_gain
+		and candidate_profile[1] <= base_profile[1] + 1e-12
+	)
+	return bool(use_candidate), float(margin_gain) if np.isfinite(margin_gain) else 0.0
+
+
+def select_phase_concordance_scores(
+		train_candidate, train_baseline, test_candidate, test_baseline, quantile=0.99):
+	"""Apply one train-only M3 gate consistently to calibration and test scores."""
+	use_candidate, margin_gain = phase_concordance_guard(
+		train_candidate, train_baseline, quantile=quantile
+	)
+	if use_candidate:
+		return train_candidate, test_candidate, True, margin_gain
+	return train_baseline, test_baseline, False, margin_gain
 
 
 def _topk_channel_mean(residuals, k):
@@ -292,11 +270,12 @@ def _topk_channel_mean(residuals, k):
 
 
 def monotonic_guarded_topk_aggregation(train_residuals, test_residuals, quantile=0.99):
-	"""Choose sparse raw-residual Top-K only when its POT tail margin beats mean.
+	"""Select Top-K on a held-out train tail, with mean as a no-regression fallback.
 
-	The gate is selected without test labels. It protects the M3 mean score as
-	the fallback, while making no claim that an unlabeled margin guarantees a
-	classification-metric improvement.
+	The selector never inspects test scores or labels. It uses the earlier train
+	segment to fit POT and the final train segment as an unlabeled validation set.
+	The guard compares validation tail margin and threshold exceedance against
+	full-channel mean; it is a score-space safeguard, not an F1 guarantee.
 	"""
 	train = np.asarray(train_residuals, dtype=np.float64)
 	test = np.asarray(test_residuals, dtype=np.float64)
@@ -310,26 +289,47 @@ def monotonic_guarded_topk_aggregation(train_residuals, test_residuals, quantile
 		raise ValueError('Top-k aggregation requires finite residuals.')
 	features = train.shape[1]
 	from src.pot import pot_eval
+	if features == 1 or train.shape[0] < 10:
+		return train.mean(axis=1), test.mean(axis=1), features, 0.0, 0.0
+	validation_start = max(1, min(train.shape[0] - 1, int(np.floor(train.shape[0] * 0.8))))
+	calibration = train[:validation_start]
+	validation = train[validation_start:]
 
 	def candidate(k):
-		train_score = _topk_channel_mean(train, k)
-		test_score = _topk_channel_mean(test, k)
-		threshold_result, _ = pot_eval(train_score, test_score, np.zeros(test_score.shape[0], dtype=np.int8))
+		calibration_score = _topk_channel_mean(calibration, k)
+		validation_score = _topk_channel_mean(validation, k)
+		threshold_result, _ = pot_eval(
+			calibration_score, validation_score,
+			np.zeros(validation_score.shape[0], dtype=np.int8),
+		)
 		threshold = float(threshold_result['threshold'])
-		tail = float(np.quantile(test_score, quantile))
-		spread = float(np.quantile(train_score, 0.75) - np.quantile(train_score, 0.25))
+		tail = float(np.quantile(validation_score, quantile))
+		spread = float(np.quantile(calibration_score, 0.75) - np.quantile(calibration_score, 0.25))
 		margin = (tail - threshold) / max(spread, SCORE_EPS)
-		return train_score, test_score, threshold, margin
+		exceedance = float(np.mean(validation_score > threshold))
+		return margin, exceedance
 
 	baseline = candidate(features)
 	selected_k = features
-	selected = baseline
+	selected_margin = baseline[0]
 	for k in range(1, features):
 		current = candidate(k)
-		if current[3] > selected[3] + 1e-12:
+		meaningful_gain = max(0.05, abs(baseline[0]) * 0.1)
+		# Require a material margin gain and at least a 10% lower validation
+		# exceedance rate. Otherwise k=D remains exactly the mean-score fallback.
+		if (
+			current[0] > selected_margin + meaningful_gain
+			and current[1] <= baseline[1] * 0.9 + 1e-12
+		):
 			selected_k = k
-			selected = current
-	return selected[0], selected[1], selected_k, baseline[3], selected[3]
+			selected_margin = current[0]
+	return (
+		_topk_channel_mean(train, selected_k),
+		_topk_channel_mean(test, selected_k),
+		selected_k,
+		baseline[0],
+		selected_margin,
+	)
 
 
 def kurtosis_gated_normalized_aggregation(train_residuals, test_residuals, topk=3, epsilon=SCORE_EPS):

@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import os
 import random
 import sys
@@ -37,10 +38,12 @@ def import_experiment_utils(dataset, model_name):
 	try:
 		from src.experiment_utils import (
 			build_model,
+			DatasetLabelsUnavailable,
 			evaluate_experiment_model,
 			load_checkpoint,
 			load_processed_dataset,
 			prepare_experiment_data,
+			predict_tranad,
 			save_checkpoint,
 			train_experiment_epoch,
 			validation_reconstruction_loss,
@@ -50,10 +53,12 @@ def import_experiment_utils(dataset, model_name):
 		sys.argv = original_argv
 	return {
 		'build_model': build_model,
+		'DatasetLabelsUnavailable': DatasetLabelsUnavailable,
 		'evaluate_experiment_model': evaluate_experiment_model,
 		'load_checkpoint': load_checkpoint,
 		'load_processed_dataset': load_processed_dataset,
 		'prepare_experiment_data': prepare_experiment_data,
+		'predict_tranad': predict_tranad,
 		'save_checkpoint': save_checkpoint,
 		'train_experiment_epoch': train_experiment_epoch,
 		'validation_reconstruction_loss': validation_reconstruction_loss,
@@ -101,7 +106,7 @@ def parse_args():
 		help='Checkpoint path; defaults to checkpoints/{dataset}/{variant}/seed_{seed}/model_best.pt.')
 	parser.add_argument('--log-dir', type=str, default=None)
 	parser.add_argument('--metrics-csv', type=str, default='experiments_results/ablation_raw_metrics.csv')
-	parser.add_argument('--score-agg', choices=('mean', 'monotonic_topk', 'kurtosis_gated'), default=None)
+	parser.add_argument('--score-agg', choices=('mean', 'topk', 'monotonic_topk', 'kurtosis_gated'), default=None)
 	parser.add_argument('--less', action='store_true', help='Train using 20%% of the available training series.')
 	return parser.parse_args()
 
@@ -139,8 +144,12 @@ def main():
 	os.chdir(PROJECT_ROOT)
 	files = processed_files(args.dataset)
 	if not all(path.is_file() for path in files):
-		warn_dataset_missing(args.dataset)
-		return 0
+		if args.dataset != 'MSDS' or not all(
+			(PROJECT_ROOT / 'data' / 'MSDS' / name).is_file()
+			for name in ('train.csv', 'test.csv', 'labels.csv')
+		):
+			warn_dataset_missing(args.dataset)
+			return 0
 	if args.mode in ('train', 'train-test') and args.epochs < 1:
 		raise SystemExit('--epochs must be at least 1 when training.')
 	if args.batch_size < 1:
@@ -161,7 +170,12 @@ def main():
 	utils = import_experiment_utils(args.dataset, model_name)
 	device = get_best_device(args.device, model_name)
 	dtype = get_dtype_for_device(device)
-	train_np, test_np, labels = utils['load_processed_dataset'](args.dataset, less=args.less)
+	try:
+		train_np, test_np, labels = utils['load_processed_dataset'](args.dataset, less=args.less)
+	except utils['DatasetLabelsUnavailable'] as exc:
+		warn_dataset_missing(args.dataset)
+		print(f'[WARN] {exc}', file=sys.stderr)
+		return 0
 	label_status = label_evaluation_status(np.any(labels > 0.1, axis=1))
 	if label_status != 'ok':
 		print(
@@ -199,7 +213,8 @@ def main():
 	if not log_dir.is_absolute():
 		log_dir = PROJECT_ROOT / log_dir
 	log_dir.mkdir(parents=True, exist_ok=True)
-	score_agg = args.score_agg or ('monotonic_topk' if args.variant == 'M4' else 'mean')
+	score_agg = args.score_agg or ('topk' if args.variant == 'M4' else 'mean')
+	score_topk = 'auto' if args.variant == 'M4' and args.score_agg in (None, 'topk') else 3
 	config = {
 		'variant': args.variant,
 		'dataset': args.dataset,
@@ -215,19 +230,21 @@ def main():
 		'device': str(device),
 		'dtype': str(dtype),
 		'score_agg': score_agg,
+		'score_topk': score_topk,
 		'lr_scheduler': 'StepLR(step_size=5,gamma=0.9)',
 		'graph_active_variance_epsilon': 1e-4,
 		'graph_soft_threshold_initial': 0.3,
 		'prototype_count': 16,
 		'prototype_residual_scale': 0.1,
-		'm3_ema_beta': 0.35,
-		'm3_median_window': 5,
-		'm3_mad_scale': 3.0,
-		'm3_horizon_decay': 0.995,
-		'm3_horizon_weight': 0.05,
-		'm4_aggregation': 'monotonic_guarded_raw_residual_topk',
+		'm3_concordance_ratio_clip': [0.85, 1.25],
+		'm3_isolated_spike_shrinkage': 0.25,
+		'm3_train_only_non_degradation_guard': True,
+		'm4_aggregation': 'validation_selected_topk',
+		'm4_required_margin_gain': 'max(0.05, 10% of baseline margin)',
+		'm4_max_validation_exceedance_ratio': 0.9,
 		'checkpoint': str(checkpoint_path),
 	}
+	score_reference_path = checkpoint_path.parent / 'score_reference_epoch5.json'
 
 	if args.mode in ('train', 'train-test'):
 		optimizer = torch.optim.AdamW(model.parameters(), lr=model.lr, weight_decay=args.weight_decay)
@@ -237,6 +254,8 @@ def main():
 		loss_curve = []
 		loss_curve_path = checkpoint_path.parent / 'loss_curve.csv'
 		checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+		if score_reference_path.exists():
+			score_reference_path.unlink()
 		aux_weights = {'default': 1.0, 'association': 0.01, 'memory_entropy': 0.001}
 		best_validation_loss = float('inf')
 		early_stopping_reference = float('inf')
@@ -263,6 +282,39 @@ def main():
 			history.append(row)
 			if initial_reconstruction_loss is None:
 				initial_reconstruction_loss = metrics['recon_loss']
+			if epoch == 4:
+				epoch5_residuals, _, epoch5_base_score = utils['predict_tranad'](
+					model, train_data, args.batch_size, return_base_score=True
+				)
+				if args.variant in ('M3', 'M4'):
+					from src.tranad_progressive import phase_concordance_guard
+					use_candidate, _ = phase_concordance_guard(epoch5_residuals, epoch5_base_score)
+					candidate_reference = {
+						'mean': np.mean(epoch5_residuals, axis=0).tolist(),
+						'std': np.std(epoch5_residuals, axis=0).tolist(),
+					}
+					baseline_reference = {
+						'mean': np.mean(epoch5_base_score, axis=0).tolist(),
+						'std': np.std(epoch5_base_score, axis=0).tolist(),
+					}
+					selected_reference = candidate_reference if use_candidate else baseline_reference
+					score_reference = {
+						'epoch': 5,
+						'mean': selected_reference['mean'],
+						'std': selected_reference['std'],
+						'candidate': candidate_reference,
+						'baseline': baseline_reference,
+					}
+				else:
+					score_reference = {
+						'epoch': 5,
+						'mean': np.mean(epoch5_residuals, axis=0).tolist(),
+						'std': np.std(epoch5_residuals, axis=0).tolist(),
+					}
+				temporary_reference_path = score_reference_path.with_name(score_reference_path.name + '.tmp')
+				with temporary_reference_path.open('w', encoding='utf-8') as handle:
+					json.dump(score_reference, handle, indent=2, allow_nan=False)
+				os.replace(temporary_reference_path, score_reference_path)
 			is_best = validation_loss < best_validation_loss
 			if is_best:
 				best_validation_loss = validation_loss
@@ -319,6 +371,10 @@ def main():
 	checkpoint_info = utils['load_checkpoint'](str(checkpoint_path), model, device=device, dtype=dtype)
 	best_epoch = int(checkpoint_info.get('epoch', -1)) + 1
 	best_validation_loss = checkpoint_info.get('metrics', {}).get('validation_reconstruction_loss')
+	score_reference = None
+	if score_reference_path.is_file():
+		with score_reference_path.open('r', encoding='utf-8') as handle:
+			score_reference = json.load(handle)
 
 	metrics, per_dim, _, _ = utils['evaluate_experiment_model'](
 		model,
@@ -328,7 +384,9 @@ def main():
 		args.batch_size,
 		show_progress=True,
 		score_agg=score_agg,
-		topk=3,
+		topk=score_topk,
+		score_reference=score_reference,
+		best_epoch=best_epoch,
 	)
 	metrics.update({
 		'variant': args.variant,

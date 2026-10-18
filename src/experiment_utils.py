@@ -21,6 +21,10 @@ DATASET_PREFIX = {
 	'NAB': 'ec2_request_latency_system_failure_',
 }
 
+
+class DatasetLabelsUnavailable(RuntimeError):
+	"""A dataset cannot be evaluated because its source labels are unusable."""
+
 MODEL_ALIASES = {
 	'M0': 'TranAD_M0',
 	'M1': 'TranAD_M1',
@@ -46,23 +50,45 @@ def cut_array(percentage, arr):
 
 def load_processed_dataset(dataset, less=False):
 	folder = os.path.join(output_folder, dataset)
-	if not os.path.exists(folder):
-		raise FileNotFoundError(f'Processed data not found: {folder}')
 	prefix = DATASET_PREFIX.get(dataset, '')
-	arrays = []
-	for split in ['train', 'test', 'labels']:
-		arrays.append(np.load(os.path.join(folder, f'{prefix}{split}.npy')))
-	if dataset == 'MSDS' and arrays[2].shape[0] != arrays[1].shape[0]:
-		# Older processed MSDS labels were saved at the original sampling rate,
-		# while train/test were downsampled by five in preprocess.py.
-		aligned_labels = arrays[2][::5]
-		if aligned_labels.shape[0] != arrays[1].shape[0]:
-			raise ValueError(
-				f'MSDS labels have {arrays[2].shape[0]} rows but test data has '
-				f'{arrays[1].shape[0]} rows; applying the expected 5x label sampling '
-				'did not align them. Re-run `python preprocess.py MSDS`.'
-			)
-		arrays[2] = aligned_labels
+	paths = [os.path.join(folder, f'{prefix}{split}.npy') for split in ('train', 'test', 'labels')]
+
+	def read_arrays():
+		return [np.load(path) for path in paths]
+
+	if dataset == 'MSDS':
+		def regenerate_msds():
+			from preprocess import load_data
+			try:
+				load_data('MSDS')
+			except (OSError, ValueError) as exc:
+				raise DatasetLabelsUnavailable(str(exc)) from exc
+
+		if not all(os.path.isfile(path) for path in paths):
+			regenerate_msds()
+		arrays = read_arrays()
+		if arrays[2].ndim == 1:
+			arrays[2] = arrays[2][:, None]
+		if arrays[2].shape[0] != arrays[1].shape[0] or arrays[2].shape[1] != arrays[1].shape[1]:
+			from preprocess import align_msds_label_array
+			try:
+				arrays[2] = align_msds_label_array(arrays[2], arrays[1].shape[0], arrays[1].shape[1])
+			except ValueError:
+				regenerate_msds()
+				arrays = read_arrays()
+		if not np.any(np.nan_to_num(arrays[2], nan=0.0, posinf=0.0, neginf=0.0) > 0.1):
+			# Treat all-zero caches as stale. Regeneration validates the source
+			# annotations and refuses to rewrite a placeholder as ground truth.
+			regenerate_msds()
+			arrays = read_arrays()
+			if not np.any(np.nan_to_num(arrays[2], nan=0.0, posinf=0.0, neginf=0.0) > 0.1):
+				raise DatasetLabelsUnavailable(
+					'MSDS source labels remain empty after regeneration; supervised evaluation is skipped.'
+				)
+	else:
+		if not os.path.exists(folder):
+			raise FileNotFoundError(f'Processed data not found: {folder}')
+		arrays = read_arrays()
 	if less:
 		arrays[0] = cut_array(0.2, arrays[0])
 	return arrays[0], arrays[1], arrays[2]
@@ -457,11 +483,13 @@ def train_experiment_epoch(model, train_data, optimizer, scheduler, epoch, batch
 	raise ValueError(f'Training is not implemented for {_model_name(model)} in this experiment entrypoint.')
 
 
-def predict_tranad(model, windows, batch_size):
+def predict_tranad(model, windows, batch_size, return_base_score=False):
 	model.eval()
 	criterion = nn.MSELoss(reduction='none')
 	feats = windows.shape[-1]
 	losses, preds = [], []
+	phase1_losses, phase2_losses = [], []
+	use_phase_concordance = int(getattr(model, 'variant_level', 0)) >= 3
 	with torch.no_grad():
 		for start_index in range(0, windows.shape[0], batch_size):
 			batch = windows[start_index:start_index + batch_size]
@@ -470,13 +498,30 @@ def predict_tranad(model, windows, batch_size):
 			elem = window[-1, :, :].view(1, local_bs, feats)
 			output = model(window, elem)
 			if isinstance(output, tuple):
-				output = output[1]
-			if getattr(model, 'uses_kurtosis_aggregation', False):
-				losses.append((output - elem).abs()[0])
-			else:
-				losses.append(criterion(output, elem)[0])
+				phase1, phase2 = output
+				output = phase2
+				if use_phase_concordance:
+					phase1_losses.append((phase1 - elem).abs()[0].detach().cpu().numpy())
+					phase2_losses.append((phase2 - elem).abs()[0].detach().cpu().numpy())
+			if not use_phase_concordance:
+				if getattr(model, 'uses_kurtosis_aggregation', False):
+					losses.append((output - elem).abs()[0])
+				else:
+					losses.append(criterion(output, elem)[0])
 			preds.append(output[0])
-	return torch.cat(losses, dim=0).detach().cpu().numpy(), torch.cat(preds, dim=0).detach().cpu().numpy()
+	if use_phase_concordance:
+		from src.tranad_progressive import phase_concordant_residuals, zero_smearing_spike_filter
+		phase1 = np.concatenate(phase1_losses, axis=0)
+		phase2 = np.concatenate(phase2_losses, axis=0)
+		losses_np = zero_smearing_spike_filter(phase_concordant_residuals(phase1, phase2))
+		base_score = np.square(phase2)
+	else:
+		losses_np = torch.cat(losses, dim=0).detach().cpu().numpy()
+		base_score = losses_np
+	predictions_np = torch.cat(preds, dim=0).detach().cpu().numpy()
+	if return_base_score:
+		return losses_np, predictions_np, base_score
+	return losses_np, predictions_np
 
 
 def predict_omni(model, sequence, batch_size=None):
@@ -519,29 +564,10 @@ def predict_dagmm(model, windows, batch_size=None):
 	return final_loss.detach().cpu().numpy(), final_pred.detach().cpu().numpy()
 
 
-def _prepare_tranad_score_calibration(model, train_windows, test_windows, train_loss, test_loss):
-	"""Apply the requested M3 score transforms and protect POT's init scores."""
-	from src.tranad_progressive import (
-		causal_horizon_shift_scores,
-		causal_persistence_filter,
-		iqr_calibration_floor,
-	)
-
-	train_reference = train_windows[:, -1, :].detach().cpu().numpy()
-	train_mean = np.mean(train_reference, axis=0)
-	train_std = np.std(train_reference, axis=0)
-	variant_level = int(getattr(model, 'variant_level', 0))
-	if variant_level >= 3:
-		train_loss = causal_persistence_filter(train_loss, beta=0.35)
-		test_loss = causal_persistence_filter(test_loss, beta=0.35)
-		train_loss = train_loss + 0.05 * causal_horizon_shift_scores(
-			train_windows, train_mean, train_std, decay=0.995
-		)
-		test_loss = test_loss + 0.05 * causal_horizon_shift_scores(
-			test_windows, train_mean, train_std, decay=0.995
-		)
-	train_loss, score_floor = iqr_calibration_floor(train_loss, train_reference, noise_scale=0.05)
-	return train_loss, test_loss, score_floor
+def _anchor_tranad_train_scores(train_loss, score_reference=None, best_epoch=None):
+	"""Apply epoch-five train-score anchoring without altering test residuals."""
+	from src.tranad_progressive import anchor_residual_scale
+	return anchor_residual_scale(train_loss, score_reference, best_epoch, anchor_epoch=5)
 
 
 def predict_usad(model, windows, batch_size=None):
@@ -642,39 +668,14 @@ def aggregate_scores(loss, method='mean', topk=3):
 
 
 def select_adaptive_topk(train_loss, test_loss, labels, show_progress=False):
+	"""Choose k on an unlabeled held-out train segment, never on test labels."""
+	from src.tranad_progressive import monotonic_guarded_topk_aggregation
+	train_final, test_final, selected_k, mean_margin, selected_margin = monotonic_guarded_topk_aggregation(
+		train_loss, test_loss
+	)
 	labels_final = (np.sum(labels, axis=1) >= 1) + 0
-	n_features = int(test_loss.shape[1])
-	if n_features < 1:
-		raise ValueError('Adaptive top-k selection requires at least one feature dimension.')
-	if label_evaluation_status(labels_final) != 'ok':
-		# There is no ground truth with which to tune k. Use a deterministic
-		# top-1 score and let evaluation report the supervised metrics as NA.
-		train_final = aggregate_scores(train_loss, 'topk', topk=1)
-		test_final = aggregate_scores(test_loss, 'topk', topk=1)
-		result, pred = pot_eval(train_final, test_final, labels_final)
-		return 1, result, pred, train_final, test_final
-	best = None
-	best_rank = None
-	iterator = range(1, n_features + 1)
-	if show_progress:
-		iterator = tqdm(iterator, desc='Adaptive top-k', leave=False)
-	for k in iterator:
-		train_final = aggregate_scores(train_loss, 'topk', topk=k)
-		test_final = aggregate_scores(test_loss, 'topk', topk=k)
-		result, pred = pot_eval(train_final, test_final, labels_final)
-		rank = (
-			float(result.get('f1', 0.0)),
-			float(result.get('ROC/AUC', 0.0)),
-			float(result.get('precision', 0.0)),
-			float(result.get('recall', 0.0)),
-			-k,
-		)
-		if best is None or rank > best_rank:
-			best = (k, result, pred, train_final, test_final)
-			best_rank = rank
-	if best is None:
-		raise ValueError('Adaptive top-k selection requires at least one feature dimension.')
-	return best
+	result, pred = pot_eval(train_final, test_final, labels_final)
+	return selected_k, result, pred, train_final, test_final, mean_margin, selected_margin
 
 
 def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, score_agg='mean', topk=3):
@@ -723,9 +724,11 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		selected_topk = float(np.mean(test_ks)) if test_ks.size else None
 		final_result, final_pred = pot_eval(train_final, test_final, (np.sum(labels, axis=1) >= 1) + 0)
 	elif score_agg == 'topk' and is_auto_topk(topk):
-		selected_topk, final_result, final_pred, train_final, test_final = select_adaptive_topk(
+		(selected_topk, final_result, final_pred, train_final, test_final,
+		 mean_margin, selected_margin) = select_adaptive_topk(
 			train_loss, test_loss, labels, show_progress=show_progress
 		)
+		guard_margin_gain = selected_margin - mean_margin
 	else:
 		train_final = aggregate_scores(train_loss, score_agg, topk=topk)
 		test_final = aggregate_scores(test_loss, score_agg, topk=topk)
@@ -737,7 +740,7 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		'roc_auc': final_result['ROC/AUC'],
 		'threshold': final_result['threshold'],
 		'score_agg': ('monotonic_topk' if score_agg == 'kurtosis_gated' else score_agg),
-		'score_topk': (_fixed_topk(selected_topk, test_loss.shape[1]) if score_agg in {'kurtosis_gated', 'monotonic_topk'} else
+		'score_topk': (_fixed_topk(selected_topk, test_loss.shape[1]) if score_agg in {'kurtosis_gated', 'monotonic_topk'} or (score_agg == 'topk' and is_auto_topk(topk)) else
 			'adaptive' if score_agg == 'adaptive_topk' else
 			'auto' if is_auto_topk(topk) else
 			(_fixed_topk(topk, test_loss.shape[1]) if score_agg == 'topk' else None)),
@@ -756,17 +759,38 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 	return metrics, per_dim, np.asarray(final_pred), train_final, test_final
 
 
-def evaluate_tranad(model, train_windows, test_windows, labels, batch_size, show_progress=False, score_agg='mean', topk=3):
-	train_loss, _ = predict_tranad(model, train_windows, batch_size)
-	test_loss, y_pred = predict_tranad(model, test_windows, batch_size)
-	train_loss, test_loss, score_floor = _prepare_tranad_score_calibration(
-		model, train_windows, test_windows, train_loss, test_loss
+def evaluate_tranad(model, train_windows, test_windows, labels, batch_size, show_progress=False,
+		score_agg='mean', topk=3, score_reference=None, best_epoch=None):
+	train_loss, _, train_base_score = predict_tranad(
+		model, train_windows, batch_size, return_base_score=True
+	)
+	test_loss, y_pred, test_base_score = predict_tranad(
+		model, test_windows, batch_size, return_base_score=True
+	)
+	phase_concordance_applied = False
+	phase_concordance_margin_gain = None
+	if int(getattr(model, 'variant_level', 0)) >= 3:
+		from src.tranad_progressive import select_phase_concordance_scores
+		train_loss, test_loss, phase_concordance_applied, phase_concordance_margin_gain = (
+			select_phase_concordance_scores(
+				train_loss, train_base_score, test_loss, test_base_score
+			)
+		)
+	selected_reference = score_reference
+	if isinstance(score_reference, dict) and ('candidate' in score_reference or 'baseline' in score_reference):
+		reference_key = 'candidate' if phase_concordance_applied else 'baseline'
+		selected_reference = score_reference.get(reference_key, score_reference)
+	train_loss, anchor_applied = _anchor_tranad_train_scores(
+		train_loss, selected_reference, best_epoch
 	)
 	metrics, per_dim, _, _, _ = evaluate_loss_arrays(
 		train_loss, test_loss, labels, show_progress=show_progress, score_agg=score_agg, topk=topk
 	)
-	metrics['score_calibration'] = 'causal_ema_shift_iqr_noise_floor' if getattr(model, 'variant_level', 0) >= 3 else 'iqr_noise_floor'
-	metrics['init_score_floor_mean'] = float(np.mean(score_floor)) if score_floor.size else 0.0
+	metrics['score_calibration'] = 'epoch5_residual_scale_anchor' if anchor_applied else 'none'
+	metrics['epoch5_scale_anchor_applied'] = bool(anchor_applied)
+	if int(getattr(model, 'variant_level', 0)) >= 3:
+		metrics['phase_concordance_applied'] = bool(phase_concordance_applied)
+		metrics['phase_concordance_validation_margin_gain'] = float(phase_concordance_margin_gain)
 	return metrics, per_dim, y_pred, test_loss
 
 
@@ -779,11 +803,13 @@ def evaluate_omni(model, train_sequence, test_sequence, labels, batch_size, show
 	return metrics, per_dim, y_pred, test_loss
 
 
-def evaluate_experiment_model(model, train_data, test_data, labels, batch_size, show_progress=False, score_agg='mean', topk=3):
+def evaluate_experiment_model(model, train_data, test_data, labels, batch_size, show_progress=False,
+		score_agg='mean', topk=3, score_reference=None, best_epoch=None):
 	if is_tranad_model(model):
 		return evaluate_tranad(
 			model, train_data, test_data, labels, batch_size,
-			show_progress=show_progress, score_agg=score_agg, topk=topk
+			show_progress=show_progress, score_agg=score_agg, topk=topk,
+			score_reference=score_reference, best_epoch=best_epoch,
 		)
 	if is_omni_model(model):
 		return evaluate_omni(
