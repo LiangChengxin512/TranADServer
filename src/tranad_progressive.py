@@ -1,8 +1,9 @@
-"""Progressive M0--M4 TranAD ablation extensions.
+"""M0--M4 routing and label-free score helpers.
 
-The original :class:`TranAD` implementation remains the M0 reference. New
-embedding, graph, loss, and score components live here and are only attached to
-the generated ablation classes.
+M0 remains the repository's original :class:`TranAD`; M1--M4 are routed to
+existing C/G/E model variants from ``src.tranad_variants``. The earlier
+experimental component classes remain importable for compatibility, but the
+M0--M4 factory below does not attach them.
 """
 
 import math
@@ -164,11 +165,7 @@ class HollowSpatialPredictor(nn.Module):
 
 
 def progressive_reconstruction_loss(model, outputs, target, epoch):
-	"""Keep TranAD's two-stage objective unchanged for every ablation level.
-
-	M3 and M4 add causal residual scoring after reconstruction. They do not add
-	new training penalties, which keeps M0's baseline objective intact.
-	"""
+	"""Compatibility hook: M0--M4 retain the repository's two-stage objective."""
 	zero = target.new_tensor(0.0)
 	return zero, {'time_loss': 0.0, 'freq_loss': 0.0, 'freq_weight': 0.0, 'trend_loss': 0.0}
 
@@ -213,144 +210,101 @@ def apply_channel_fidelity_gate(m2_train, m2_test, m1_train, m1_test, tail_fract
 	return train, test, regressed
 
 
-def _event_spans(over_mask, merge_gap=2):
-	indices = np.flatnonzero(over_mask)
-	if not indices.size:
-		return []
-	spans = []
-	start = previous = int(indices[0])
-	for index in indices[1:]:
-		index = int(index)
-		if index - previous - 1 > merge_gap:
-			spans.append((start, previous + 1))
-			start = index
-		previous = index
-	spans.append((start, previous + 1))
-	return spans
+def _tail_snr(calibration, validation):
+	calibration = np.asarray(calibration, dtype=np.float64).reshape(-1)
+	validation = np.asarray(validation, dtype=np.float64).reshape(-1)
+	if calibration.size == 0 or validation.size == 0:
+		return float('-inf')
+	center = float(np.median(calibration))
+	scale = float(np.std(calibration))
+	return (float(np.quantile(validation, 0.99)) - center) / max(scale, SCORE_EPS)
 
 
-def suppress_marginal_glitches(scores, threshold, rho=0.45, max_duration=2, peak_ratio=2.2, merge_gap=2):
-	"""Dampen only short, weak score clusters while keeping the threshold fixed."""
-	values = np.asarray(scores, dtype=np.float64).reshape(-1).copy()
-	if not 0.0 <= rho <= 1.0 or max_duration < 1 or peak_ratio <= 1.0:
-		raise ValueError('Invalid glitch suppression parameters.')
-	spans = _event_spans(values > threshold, merge_gap=merge_gap)
-	suppressed = 0
-	for start, stop in spans:
-		peak = float(np.max(values[start:stop]))
-		ratio = peak / max(float(threshold), SCORE_EPS)
-		if stop - start <= max_duration and ratio < peak_ratio:
-			mask = values[start:stop] > threshold
-			values[start + np.flatnonzero(mask)] *= rho
-			suppressed += 1
-	return values, {'suppressed_glitch_events': suppressed, 'threshold_events': len(spans)}
-
-
-def boost_sustained_segments(test_score, train_score, n_features, window=50, run_length=30, factor=1.35):
-	"""Boost sustained multichannel score elevations using causal rolling means."""
-	test = np.asarray(test_score, dtype=np.float64).reshape(-1).copy()
-	train = np.asarray(train_score, dtype=np.float64).reshape(-1)
-	if int(n_features) < 20 or test.size < run_length or train.size < 1:
-		return test, 0
-	window = max(1, min(int(window), train.size, test.size))
-	def trailing_mean(values):
-		cumulative = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
-		indices = np.arange(values.size)
-		starts = np.maximum(0, indices - window + 1)
-		return (cumulative[indices + 1] - cumulative[starts]) / (indices - starts + 1)
-	cutoff = float(np.quantile(trailing_mean(train), 0.95))
-	above = trailing_mean(test) > cutoff
-	spans = _event_spans(above, merge_gap=0)
-	boosted = 0
-	for start, stop in spans:
-		if stop - start >= run_length:
-			test[start:stop] *= factor
-			boosted += 1
-	return test, boosted
-
-
-def _topk_event_profile(score, threshold, train_score=None, merge_gap=2):
-	values = np.asarray(score, dtype=np.float64).reshape(-1)
-	spans = _event_spans(values > threshold, merge_gap=merge_gap)
-	robust = []
-	weak = 0
-	prominence = 0.0
-	robust_prominence = 0.0
-	train = np.asarray(train_score, dtype=np.float64).reshape(-1) if train_score is not None else np.array([])
-	noise_floor = float(np.quantile(train, 0.98)) if train.size else 0.0
-	noise_scale = max(float(np.std(train)), SCORE_EPS) if train.size else 1.0
-	robust_snr = 0.0
-	for start, stop in spans:
-		segment = values[start:stop]
-		ratio = float(np.max(segment)) / max(float(threshold), SCORE_EPS)
-		is_robust = stop - start >= 3 or ratio >= 2.2
-		if is_robust:
-			robust.append((start, stop))
-		segment_prominence = float(np.maximum(segment - threshold, 0.0).sum())
-		prominence += segment_prominence
-		if is_robust:
-			robust_prominence += segment_prominence
-			robust_snr += max(0.0, (float(np.max(segment)) - noise_floor) / noise_scale)
-		if stop - start <= 2 and ratio < 2.2:
-			weak += 1
-	return {
-		'robust_events': len(robust), 'prominence': prominence,
-		'robust_prominence': robust_prominence, 'robust_snr': robust_snr,
-		'weak_events': weak,
-	}
-
-
-def m4_candidate_ks(n_features):
-	values = {int(n_features)}
-	values.update(k for k in (1, 2, 3, 4, 5, 8, 12, 16) if k <= n_features)
-	k = 32
-	while k < n_features:
-		values.add(k)
-		k *= 2
-	return sorted(values)
-
-
-def select_m4_topk(train_residuals, test_residuals, n_features=None):
-	"""Select Top-K by unlabeled test event shape; threshold is fitted on train."""
-	from src.pot import pot_eval
+def adaptive_topk_with_validation_guard(train_residuals, test_residuals):
+	"""Use row-wise adaptive Top-K only when its unlabeled train-tail SNR beats mean."""
 	train = np.asarray(train_residuals, dtype=np.float64)
 	test = np.asarray(test_residuals, dtype=np.float64)
-	features = train.shape[1] if n_features is None else int(n_features)
-	if train.ndim != 2 or test.ndim != 2 or train.shape[1] != test.shape[1] or features != train.shape[1]:
-		raise ValueError('M4 selection expects matching [time, channels] residual arrays.')
-	candidates = []
-	for k in m4_candidate_ks(features):
-		train_score = _topk_channel_mean(train, k)
-		test_score = _topk_channel_mean(test, k)
-		result, _ = pot_eval(train_score, test_score, np.zeros(test_score.size, dtype=np.int8))
-		threshold = float(result['threshold'])
-		processed, glitch_info = suppress_marginal_glitches(test_score, threshold)
-		processed, boosted = boost_sustained_segments(processed, train_score, features)
-		profile = _topk_event_profile(processed, threshold, train_score=train_score)
-		candidates.append({
-			'k': k, 'train_score': train_score, 'test_score': processed,
-			'threshold': threshold, 'profile': profile,
-			'suppressed_glitch_events': glitch_info['suppressed_glitch_events'],
-			'boosted_sustained_segments': boosted,
-		})
-	baseline = next(item for item in candidates if item['k'] == features)
-	selected = baseline
-	base_profile = baseline['profile']
-	for item in candidates:
-		if item['k'] == features:
+	if train.ndim != 2 or test.ndim != 2 or train.shape[1] != test.shape[1] or train.shape[1] == 0:
+		raise ValueError('Adaptive Top-K expects matching [time, channels] residual matrices.')
+	mean_train = np.mean(train, axis=1)
+	mean_test = np.mean(test, axis=1)
+	if train.shape[0] < 10 or train.shape[1] == 1:
+		return mean_train, mean_test, np.full(test.shape[0], train.shape[1]), False, 0.0, 0.0
+	split = max(1, min(train.shape[0] - 1, int(np.floor(train.shape[0] * 0.8))))
+	adaptive_train, train_ks = adaptive_topk_scores(train)
+	adaptive_test, test_ks = adaptive_topk_scores(test)
+	cal_mean, val_mean = mean_train[:split], mean_train[split:]
+	cal_adaptive, val_adaptive = adaptive_train[:split], adaptive_train[split:]
+	mean_snr = _tail_snr(cal_mean, val_mean)
+	adaptive_snr = _tail_snr(cal_adaptive, val_adaptive)
+	if adaptive_snr < mean_snr:
+		return mean_train, mean_test, np.full(test.shape[0], train.shape[1]), False, mean_snr, adaptive_snr
+	return adaptive_train, adaptive_test, test_ks, True, mean_snr, adaptive_snr
+
+
+def filter_background_marginal_fps(test_scores, train_scores, threshold):
+	"""Remove only score-only, isolated one-point crossings in a low-energy background."""
+	test = np.asarray(test_scores, dtype=np.float64).reshape(-1).copy()
+	train = np.asarray(train_scores, dtype=np.float64).reshape(-1)
+	if test.size == 0 or train.size == 0 or not np.isfinite(threshold) or threshold <= 0:
+		return test, 0
+	over = test > threshold
+	train_median = float(np.median(train))
+	removed = 0
+	for index in np.flatnonzero(over):
+		index = int(index)
+		if (index > 0 and over[index - 1]) or (index + 1 < len(over) and over[index + 1]):
 			continue
-		profile = item['profile']
-		retains_events = profile['robust_events'] >= base_profile['robust_events']
-		improves_prominence = profile['robust_prominence'] > base_profile['robust_prominence'] * 1.01 + SCORE_EPS
-		improves_snr = profile['robust_snr'] > base_profile['robust_snr'] * 1.01 + SCORE_EPS
-		reduces_glitches = item['suppressed_glitch_events'] < baseline['suppressed_glitch_events']
-		if retains_events and (improves_prominence or improves_snr or reduces_glitches):
-			if (profile['robust_events'], profile['robust_snr'], profile['robust_prominence'], -item['suppressed_glitch_events']) > (
-				selected['profile']['robust_events'], selected['profile']['robust_snr'],
-				selected['profile']['robust_prominence'], -selected['suppressed_glitch_events'],
-			):
-				selected = item
-	return selected
+		ratio = test[index] / threshold
+		if not 1.0 < ratio < 1.12:
+			continue
+		left50, right50 = max(0, index - 25), min(test.size, index + 26)
+		if np.any(over[left50:index]) or np.any(over[index + 1:right50]):
+			continue
+		left10, right10 = max(0, index - 10), min(test.size, index + 11)
+		neighbors = np.concatenate((test[left10:index], test[index + 1:right10]))
+		if neighbors.size == 0 or float(np.median(neighbors)) >= train_median:
+			continue
+		test[index] = np.nextafter(float(threshold), -np.inf)
+		removed += 1
+	return test, removed
+
+
+def awaken_swat_platforms(train_residuals, test_residuals, test_scores, threshold, dataset):
+	"""Boost only clean, sub-threshold, sustained, multichannel SWaT platform events."""
+	train = np.asarray(train_residuals, dtype=np.float64)
+	test = np.asarray(test_residuals, dtype=np.float64)
+	scores = np.asarray(test_scores, dtype=np.float64).reshape(-1).copy()
+	if str(dataset).upper() != 'SWAT' or train.shape[1] < 20 or scores.size < 25 or threshold <= 0:
+		return scores, 0
+	over = scores > threshold
+	starts = np.flatnonzero(over & ~np.r_[False, over[:-1]])
+	ends = np.flatnonzero(over & ~np.r_[over[1:], False]) + 1
+	isolated_rate = sum((end - start) == 1 for start, end in zip(starts, ends)) / max(scores.size, 1)
+	if isolated_rate >= 0.0005:
+		return scores, 0
+	band = (scores >= 0.70 * threshold) & (scores <= threshold)
+	band_starts = np.flatnonzero(band & ~np.r_[False, band[:-1]])
+	band_ends = np.flatnonzero(band & ~np.r_[band[1:], False]) + 1
+	train_diff = np.diff(train, axis=0)
+	train_diff_var = np.var(train_diff, axis=0) if train_diff.size else np.zeros(train.shape[1])
+	low_variance_limit = float(np.quantile(train_diff_var, 0.10)) if train_diff_var.size else 0.0
+	channel_q95 = np.quantile(train, 0.95, axis=0)
+	cooccurrence_min = max(3, int(np.ceil(0.25 * train.shape[1])))
+	boosted = 0
+	for start, end in zip(band_starts, band_ends):
+		if end - start < 25:
+			continue
+		segment = test[start:end]
+		local_diff_var = float(np.mean(np.var(np.diff(segment, axis=0), axis=0))) if end - start > 1 else float('inf')
+		cooccurring = int(np.sum(np.median(segment, axis=0) > channel_q95))
+		if local_diff_var <= low_variance_limit or cooccurring >= cooccurrence_min:
+			scores[start:end] = np.maximum(
+				scores[start:end] * 1.30,
+				np.nextafter(float(threshold), np.inf),
+			)
+			boosted += 1
+	return scores, boosted
 
 
 def _topk_channel_mean(residuals, k):
@@ -434,41 +388,42 @@ def kurtosis_gated_normalized_aggregation(train_residuals, test_residuals, topk=
 	return train_score, test_score, selected_k
 
 
+def _variant_tokens(variant, n_features, dataset):
+	dataset = str(dataset or '').upper()
+	if variant == 'M1':
+		if int(n_features) == 1 or dataset in {'UCR', 'NAB', 'SWAT', 'SMD'}:
+			return ('E',)
+		return ('C', 'E')
+	if int(n_features) == 1 or dataset == 'UCR':
+		return ('G', 'E')
+	if dataset == 'SYNTHETIC':
+		return ('C', 'G')
+	return ('C', 'G', 'E')
+
+
 def make_tranad_ablation_class(variant):
 	if variant not in ABLATION_VARIANTS:
 		raise AttributeError(f'Unknown TranAD ablation variant: {variant}')
-	# Delayed import avoids a cycle while src.models is initializing.
+	# Reuse the repository's C/G/E variants as the M1--M4 model family.
 	from src.models import TranAD
+	from src.tranad_variants import TranADVariant
 
-	class TranADProgressive(TranAD):
-		def __init__(self, feats):
-			super().__init__(feats)
-			self.name = f'TranAD_{variant}'
-			self.variant = variant
-			self.variant_level = int(variant[1])
-			conv_scale = 0.02 if feats == 1 else 0.1
-			self.causal_embedding = MultiScaleCausalEmbedding(2 * feats, conv_scale) if self.variant_level >= 1 else None
-			self.graph_attention = HollowSpatialPredictor(feats) if self.variant_level >= 2 else None
-			self.prototype_memory = NormalPrototypeMemory(2 * feats) if self.variant_level >= 2 else None
-			self.uses_monotonic_topk = self.variant_level >= 4
-
-		def encode(self, src, c, tgt):
-			if self.variant_level == 0:
-				return super().encode(src, c, tgt)
-			if self.graph_attention is not None:
-				src = self.graph_attention(src)
-				c = self.graph_attention(c)
-			src = torch.cat((src, c), dim=2)
-			if self.causal_embedding is not None:
-				src = self.causal_embedding(src)
-			src = src * math.sqrt(self.n_feats)
-			src = self.pos_encoder(src)
-			memory = self.transformer_encoder(src)
-			if self.prototype_memory is not None:
-				mask = self.graph_attention.continuous_mask if self.graph_attention is not None else None
-				memory = self.prototype_memory(memory, mask)
-			tgt = tgt.repeat(1, 1, 2)
-			return tgt, memory
+	if variant == 'M0':
+		class TranADProgressive(TranAD):
+			def __init__(self, feats, dataset=None):
+				super().__init__(feats)
+				self.name = f'TranAD_{variant}'
+				self.variant = variant
+				self.variant_level = 0
+				self.dataset = dataset
+	else:
+		class TranADProgressive(TranADVariant):
+			def __init__(self, feats, dataset=None):
+				tokens = _variant_tokens(variant, feats, dataset)
+				super().__init__(feats, tokens=tokens, name=f'TranAD_{variant}')
+				self.variant = variant
+				self.variant_level = int(variant[1])
+				self.dataset = dataset
 
 	TranADProgressive.__name__ = f'TranAD_{variant}'
 	TranADProgressive.__qualname__ = TranADProgressive.__name__

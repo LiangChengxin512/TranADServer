@@ -99,12 +99,20 @@ class FeatureGate(nn.Module):
 			nn.Linear(hidden, n_feats),
 		)
 		self.strength = nn.Parameter(torch.tensor(-2.0))
+		self.register_buffer('continuous_mask', torch.ones(n_feats, dtype=torch.bool), persistent=False)
+
+	def set_continuous_mask(self, mask):
+		mask = torch.as_tensor(mask, dtype=torch.bool, device=self.continuous_mask.device).reshape(-1)
+		if mask.numel() != self.continuous_mask.numel():
+			raise ValueError('Continuous feature mask does not match feature-gate width.')
+		self.continuous_mask.copy_(mask)
 
 	def forward(self, src):
 		x = src.permute(1, 0, 2)
 		stats = torch.cat([x.mean(dim=1), x.std(dim=1, unbiased=False)], dim=-1)
 		gate = torch.sigmoid(self.net(stats)).unsqueeze(0)
-		return src * (1.0 + torch.sigmoid(self.strength) * (gate - 0.5))
+		mask = self.continuous_mask.to(dtype=src.dtype).view(1, 1, -1)
+		return src * (1.0 + mask * torch.sigmoid(self.strength) * (gate - 0.5))
 
 
 class PhaseOutputBlend(nn.Module):
@@ -194,7 +202,10 @@ class TranADVariant(nn.Module):
 
 		self.pos_encoder = PositionalEncoding(2 * feats, 0.1, self.n_window)
 		encoder_layers = TransformerEncoderLayer(d_model=2 * feats, nhead=feats, dim_feedforward=16, dropout=0.1)
-		self.transformer_encoder = TransformerEncoder(encoder_layers, 1)
+		try:
+			self.transformer_encoder = TransformerEncoder(encoder_layers, 1, enable_nested_tensor=False)
+		except TypeError:  # Compatibility with older PyTorch releases.
+			self.transformer_encoder = TransformerEncoder(encoder_layers, 1)
 		decoder_layers1 = TransformerDecoderLayer(d_model=2 * feats, nhead=feats, dim_feedforward=16, dropout=0.1)
 		self.transformer_decoder1 = TransformerDecoder(decoder_layers1, 1)
 		decoder_layers2 = TransformerDecoderLayer(d_model=2 * feats, nhead=feats, dim_feedforward=16, dropout=0.1)
@@ -211,6 +222,10 @@ class TranADVariant(nn.Module):
 		if not self._aux_losses:
 			return next(self.parameters()).new_tensor(0.0)
 		return sum(self._aux_losses.values())
+
+	def set_continuous_mask(self, mask):
+		if self.feature_gate is not None:
+			self.feature_gate.set_continuous_mask(mask)
 
 	def encode(self, src, c, tgt):
 		src = torch.cat((src, c), dim=2)

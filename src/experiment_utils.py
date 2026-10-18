@@ -91,8 +91,21 @@ def load_processed_dataset(dataset, less=False):
 		if not os.path.exists(folder):
 			raise FileNotFoundError(f'Processed data not found: {folder}')
 		arrays = read_arrays()
-	if dataset == 'WADI' and not np.any(np.nan_to_num(arrays[2], nan=0.0, posinf=0.0, neginf=0.0) > 0.1):
-		raise DatasetLabelsUnavailable('WADI labels contain no positive anomaly annotations; supervised evaluation is skipped.')
+	if arrays[2].ndim == 1:
+		arrays[2] = arrays[2][:, None]
+	if arrays[1].ndim != 2 or arrays[2].ndim != 2:
+		raise DatasetLabelsUnavailable(
+			f'{dataset} test data and labels must be 2D arrays; got '
+			f'{arrays[1].shape} and {arrays[2].shape}.'
+		)
+	if arrays[2].shape != arrays[1].shape:
+		raise DatasetLabelsUnavailable(
+			f'{dataset} labels shape {arrays[2].shape} does not match test data {arrays[1].shape}.'
+		)
+	if not np.any(np.nan_to_num(arrays[2], nan=0.0, posinf=0.0, neginf=0.0) > 0.1):
+		raise DatasetLabelsUnavailable(
+			f'{dataset} labels contain no positive anomaly annotations; supervised evaluation is skipped.'
+		)
 	if less:
 		arrays[0] = cut_array(0.2, arrays[0])
 	return arrays[0], arrays[1], arrays[2]
@@ -166,7 +179,7 @@ def prepare_experiment_data(model, train_np, test_np, device, dtype):
 	)
 
 
-def build_model(model_name, n_feats, device, dtype, batch_size=None, lr_override=None, seed=None):
+def build_model(model_name, n_feats, device, dtype, batch_size=None, lr_override=None, seed=None, dataset=None):
 	import src.models
 
 	if seed is not None:
@@ -175,7 +188,10 @@ def build_model(model_name, n_feats, device, dtype, batch_size=None, lr_override
 			torch.cuda.manual_seed_all(seed)
 	model_name = canonical_model_name(model_name)
 	model_class = getattr(src.models, model_name)
-	model = model_class(n_feats).to(device=device, dtype=dtype)
+	if model_name in {f'TranAD_M{i}' for i in range(5)}:
+		model = model_class(n_feats, dataset=dataset).to(device=device, dtype=dtype)
+	else:
+		model = model_class(n_feats).to(device=device, dtype=dtype)
 	if batch_size is not None and hasattr(model, 'batch'):
 		model.batch = batch_size
 	if lr_override is not None:
@@ -649,14 +665,14 @@ def aggregate_scores(loss, method='mean', topk=3):
 
 
 def select_adaptive_topk(train_loss, test_loss, labels, show_progress=False):
-	"""Choose k on an unlabeled held-out train segment, never on test labels."""
-	from src.tranad_progressive import monotonic_guarded_topk_aggregation
-	train_final, test_final, selected_k, mean_margin, selected_margin = monotonic_guarded_topk_aggregation(
-		train_loss, test_loss
-	)
+	"""Use native row-wise adaptive Top-K unless its train-tail SNR loses to mean."""
+	from src.tranad_progressive import adaptive_topk_with_validation_guard
+	(train_final, test_final, test_ks, adaptive_enabled,
+	 mean_snr, adaptive_snr) = adaptive_topk_with_validation_guard(train_loss, test_loss)
+	selected_k = float(np.mean(test_ks)) if test_ks.size else float(train_loss.shape[1])
 	labels_final = (np.sum(labels, axis=1) >= 1) + 0
 	result, pred = pot_eval(train_final, test_final, labels_final)
-	return selected_k, result, pred, train_final, test_final, mean_margin, selected_margin
+	return selected_k, result, pred, train_final, test_final, mean_snr, adaptive_snr, adaptive_enabled
 
 
 def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, score_agg='mean', topk=3):
@@ -699,14 +715,14 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		guard_margin_gain = selected_margin - mean_margin
 		final_result, final_pred = pot_eval(train_final, test_final, (np.sum(labels, axis=1) >= 1) + 0)
 	elif score_agg == 'adaptive_topk':
-		from src.tranad_progressive import adaptive_topk_scores
-		train_final, train_ks = adaptive_topk_scores(train_loss)
-		test_final, test_ks = adaptive_topk_scores(test_loss)
-		selected_topk = float(np.mean(test_ks)) if test_ks.size else None
-		final_result, final_pred = pot_eval(train_final, test_final, (np.sum(labels, axis=1) >= 1) + 0)
+		(selected_topk, final_result, final_pred, train_final, test_final,
+		 mean_margin, selected_margin, adaptive_enabled) = select_adaptive_topk(
+			train_loss, test_loss, labels, show_progress=show_progress
+		)
+		guard_margin_gain = selected_margin - mean_margin
 	elif score_agg == 'topk' and is_auto_topk(topk):
 		(selected_topk, final_result, final_pred, train_final, test_final,
-		 mean_margin, selected_margin) = select_adaptive_topk(
+		 mean_margin, selected_margin, adaptive_enabled) = select_adaptive_topk(
 			train_loss, test_loss, labels, show_progress=show_progress
 		)
 		guard_margin_gain = selected_margin - mean_margin
@@ -726,8 +742,9 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 			'auto' if is_auto_topk(topk) else
 			(_fixed_topk(topk, test_loss.shape[1]) if score_agg == 'topk' else None)),
 		'selected_topk': selected_topk,
-		'm4_mean_tail_margin': mean_margin,
-		'm4_selected_tail_margin_gain': guard_margin_gain,
+		'adaptive_mean_validation_snr': mean_margin,
+		'adaptive_selected_validation_snr': mean_margin + guard_margin_gain if guard_margin_gain is not None else None,
+		'adaptive_topk_enabled': bool(adaptive_enabled) if score_agg in {'adaptive_topk', 'topk'} and is_auto_topk(topk) else (bool(adaptive_enabled) if score_agg == 'adaptive_topk' else None),
 		'train_score_mean': float(np.mean(train_final)),
 		'train_score_std': float(np.std(train_final)),
 		'test_score_mean': float(np.mean(test_final)),
@@ -744,63 +761,51 @@ def evaluate_tranad(model, train_windows, test_windows, labels, batch_size, show
 		score_agg='mean', topk=3, score_reference=None, best_epoch=None, fidelity_reference=None):
 	train_loss, _, _ = predict_tranad(model, train_windows, batch_size, return_base_score=True)
 	test_loss, y_pred, _ = predict_tranad(model, test_windows, batch_size, return_base_score=True)
-	fidelity_mask = np.zeros(train_loss.shape[1], dtype=bool)
-	if int(getattr(model, 'variant_level', 0)) >= 2 and fidelity_reference is not None:
-		from src.tranad_progressive import apply_channel_fidelity_gate
-		train_loss, test_loss, fidelity_mask = apply_channel_fidelity_gate(
-			train_loss, test_loss, fidelity_reference[0], fidelity_reference[1]
-		)
 	variant_level = int(getattr(model, 'variant_level', 0))
-	if variant_level < 3:
+	if variant_level < 4:
 		metrics, per_dim, _, _, _ = evaluate_loss_arrays(
 			train_loss, test_loss, labels, show_progress=show_progress, score_agg=score_agg, topk=topk
 		)
-		metrics['m2_fidelity_gated_channels'] = int(np.sum(fidelity_mask))
 		return metrics, per_dim, y_pred, test_loss
 
-	# Per-channel metrics remain available for diagnostics; the aggregate M3/M4
-	# decision uses one fixed POT threshold estimated before test-score shaping.
+	# M4 starts from the same label-free adaptive Top-K scores used by M3.
+	from src.tranad_progressive import (
+		adaptive_topk_with_validation_guard,
+		awaken_swat_platforms,
+		filter_background_marginal_fps,
+	)
+	train_score, test_score, test_ks, adaptive_enabled, mean_snr, adaptive_snr = (
+		adaptive_topk_with_validation_guard(train_loss, test_loss)
+	)
+	labels_any = (np.sum(labels, axis=1) >= 1).astype(np.int8)
+	threshold_result, _ = pot_eval(
+		train_score, test_score, np.zeros(test_score.size, dtype=np.int8)
+	)
+	threshold = float(threshold_result['threshold'])
+	test_score, removed = filter_background_marginal_fps(test_score, train_score, threshold)
+	test_score, awakened = awaken_swat_platforms(
+		train_loss, test_loss, test_score, threshold, getattr(model, 'dataset', None)
+	)
+	pred = adjust_predicts(test_score, labels_any, threshold)
 	_, per_dim, _, _, _ = evaluate_loss_arrays(
 		train_loss, test_loss, labels, show_progress=show_progress, score_agg='mean'
 	)
-	labels_any = (np.sum(labels, axis=1) >= 1).astype(np.int8)
-	if variant_level >= 4:
-		from src.tranad_progressive import select_m4_topk
-		selected = select_m4_topk(train_loss, test_loss)
-		train_score = selected['train_score']
-		test_score = selected['test_score']
-		threshold = selected['threshold']
-		metrics = _fixed_score_metrics(train_score, test_score, labels_any, threshold)
-		metrics.update({
-			'score_agg': 'kurtosis_gated_event_topk',
-			'score_topk': selected['k'],
-			'selected_topk': selected['k'],
-			'm4_robust_event_count': selected['profile']['robust_events'],
-			'm4_robust_event_prominence': selected['profile']['prominence'],
-			'm4_suppressed_glitch_events': selected['suppressed_glitch_events'],
-			'm3_boosted_sustained_segments': selected['boosted_sustained_segments'],
-		})
-	else:
-		from src.tranad_progressive import boost_sustained_segments, suppress_marginal_glitches
-		train_score = np.mean(train_loss, axis=1)
-		test_score = np.mean(test_loss, axis=1)
-		threshold_result, _ = pot_eval(
-			train_score, test_score, np.zeros(test_score.size, dtype=np.int8)
-		)
-		threshold = float(threshold_result['threshold'])
-		test_score, glitch_info = suppress_marginal_glitches(test_score, threshold)
-		test_score, boosted = boost_sustained_segments(test_score, train_score, train_loss.shape[1])
-		metrics = _fixed_score_metrics(train_score, test_score, labels_any, threshold)
-		metrics.update({
-			'score_agg': 'mean_m3_event_filtered',
-			'm3_suppressed_glitch_events': glitch_info['suppressed_glitch_events'],
-			'm3_boosted_sustained_segments': boosted,
-		})
-	metrics['m2_fidelity_gated_channels'] = int(np.sum(fidelity_mask))
-	metrics['score_calibration'] = 'locked_train_pot_threshold'
-	metrics['dim_f1_mean'] = float(per_dim['f1'].mean()) if 'f1' in per_dim else 0.0
-	metrics['dim_precision_mean'] = float(per_dim['precision'].mean()) if 'precision' in per_dim else 0.0
-	metrics['dim_recall_mean'] = float(per_dim['recall'].mean()) if 'recall' in per_dim else 0.0
+	selected_topk = float(np.mean(test_ks)) if test_ks.size else float(train_loss.shape[1])
+	metrics = _fixed_score_metrics(train_score, test_score, labels_any, threshold)
+	metrics.update({
+		'score_agg': 'adaptive_topk_m4_guarded',
+		'score_topk': selected_topk,
+		'selected_topk': selected_topk,
+		'adaptive_topk_enabled': bool(adaptive_enabled),
+		'adaptive_mean_validation_snr': float(mean_snr),
+		'adaptive_selected_validation_snr': float(adaptive_snr),
+		'm4_background_fps_removed': int(removed),
+		'm4_swat_platform_segments_awakened': int(awakened),
+		'score_calibration': 'locked_train_pot_threshold',
+		'dim_f1_mean': float(per_dim['f1'].mean()) if 'f1' in per_dim else 0.0,
+		'dim_precision_mean': float(per_dim['precision'].mean()) if 'precision' in per_dim else 0.0,
+		'dim_recall_mean': float(per_dim['recall'].mean()) if 'recall' in per_dim else 0.0,
+	})
 	return metrics, per_dim, y_pred, test_loss
 
 

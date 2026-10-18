@@ -14,7 +14,6 @@ BATCH_SIZE=${BATCH_SIZE:-128}
 MIN_EPOCHS=${MIN_EPOCHS:-5}
 PATIENCE=${PATIENCE:-3}
 REL_DELTA=${REL_DELTA:-0.005}
-BASELINE_LOSS_RATIO=${BASELINE_LOSS_RATIO:-0.2}
 # 正式跑五折实验时可手动修改为 SEEDS=(1 2 3 4 5)
 # POSIX sh represents that list as the space-separated string below.
 SEEDS=${SEEDS:-"1"}
@@ -56,7 +55,17 @@ dataset_available() {
 	prefix=$(dataset_prefix "$dataset")
 	folder="processed/$dataset"
 	raw_folder=$(dataset_raw_dir "$dataset")
+	processed_ready=false
+	if [ -f "$folder/${prefix}train.npy" ] &&
+		[ -f "$folder/${prefix}test.npy" ] &&
+		[ -f "$folder/${prefix}labels.npy" ] &&
+		processed_labels_available "$folder/${prefix}labels.npy"; then
+		processed_ready=true
+	fi
 	if [ "$dataset" = MSDS ]; then
+		if [ "$processed_ready" = true ]; then
+			return 0
+		fi
 		[ -f "$raw_folder/train.csv" ] &&
 		[ -f "$raw_folder/test.csv" ] &&
 		[ -f "$raw_folder/labels.csv" ] &&
@@ -67,16 +76,10 @@ dataset_available() {
 		[ -f "$raw_folder/WADI_14days.csv" ] &&
 		[ -f "$raw_folder/WADI_attackdata.csv" ] &&
 		[ -f "$raw_folder/WADI_attacklabels.csv" ] &&
-		[ -f "$folder/${prefix}train.npy" ] &&
-		[ -f "$folder/${prefix}test.npy" ] &&
-		[ -f "$folder/${prefix}labels.npy" ] &&
-		processed_labels_available "$folder/${prefix}labels.npy"
+		[ "$processed_ready" = true ]
 		return $?
 	fi
-	[ -d "$raw_folder" ] &&
-	[ -f "$folder/${prefix}train.npy" ] &&
-	[ -f "$folder/${prefix}test.npy" ] &&
-	[ -f "$folder/${prefix}labels.npy" ]
+	[ "$processed_ready" = true ]
 }
 
 for dataset in $DATASETS; do
@@ -87,8 +90,8 @@ for dataset in $DATASETS; do
 	fi
 done
 
-printf 'Device: %s | Max epochs: %s | Min epochs: %s | Batch size: %s | Patience: %s | Relative delta: %s | Baseline loss ratio: %s\n' \
-	"$DEVICE" "$EPOCHS" "$MIN_EPOCHS" "$BATCH_SIZE" "$PATIENCE" "$REL_DELTA" "$BASELINE_LOSS_RATIO"
+printf 'Device: %s | Max epochs: %s | Min epochs: %s | Batch size: %s | Patience: %s | Relative delta: %s\n' \
+	"$DEVICE" "$EPOCHS" "$MIN_EPOCHS" "$BATCH_SIZE" "$PATIENCE" "$REL_DELTA"
 printf 'Seeds: %s\nDatasets: %s\nModels: %s\n' "$SEEDS" "$AVAILABLE_DATASETS" "$MODELS"
 
 for seed in $SEEDS; do
@@ -105,7 +108,6 @@ for seed in $SEEDS; do
 				--min-epochs "$MIN_EPOCHS" \
 				--patience "$PATIENCE" \
 				--rel-delta "$REL_DELTA" \
-				--baseline-loss-ratio "$BASELINE_LOSS_RATIO" \
 				--device "$DEVICE"
 			status=$?
 			if [ "$status" -ne 0 ]; then

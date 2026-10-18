@@ -4,10 +4,18 @@
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_PREFIX = {
+	'SMD': 'machine-1-1_',
+	'SMAP': 'P-1_',
+	'MSL': 'C-1_',
+	'UCR': '136_',
+	'NAB': 'ec2_request_latency_system_failure_',
+}
 METRICS = {
 	'Precision': 'precision',
 	'Recall': 'recall',
@@ -29,6 +37,28 @@ def resolve(path):
 	return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def dataset_has_usable_labels(dataset):
+	"""Require complete processed inputs and at least one positive label."""
+	dataset = str(dataset)
+	prefix = DATASET_PREFIX.get(dataset, '')
+	folder = PROJECT_ROOT / 'processed' / dataset
+	paths = [folder / f'{prefix}{split}.npy' for split in ('train', 'test', 'labels')]
+	if not all(path.is_file() for path in paths):
+		return False
+	try:
+		train = np.load(paths[0], mmap_mode='r')
+		test = np.load(paths[1], mmap_mode='r')
+		labels = np.load(paths[2], mmap_mode='r')
+		if labels.ndim == 1:
+			labels = labels[:, None]
+		if train.ndim != 2 or test.ndim != 2 or train.shape[1] != test.shape[1] or labels.shape != test.shape:
+			return False
+		labels = np.asarray(labels)
+		return bool(np.any(np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0) > 0.1))
+	except (OSError, ValueError, TypeError):
+		return False
+
+
 def main():
 	args = parse_args()
 	input_path = resolve(args.input)
@@ -42,6 +72,19 @@ def main():
 		raise SystemExit(f'Metrics CSV is missing columns: {", ".join(sorted(missing))}')
 	for metric in METRICS.values():
 		rows[metric] = pd.to_numeric(rows[metric], errors='coerce')
+	finite_metrics = np.isfinite(rows[list(METRICS.values())].to_numpy(dtype=np.float64)).all(axis=1)
+	rows = rows.loc[finite_metrics].copy()
+	if 'dataset' in rows.columns:
+		usable = {
+			dataset: dataset_has_usable_labels(dataset)
+			for dataset in rows['dataset'].dropna().astype(str).unique()
+		}
+		rows = rows.loc[rows['dataset'].astype(str).map(usable).fillna(False)].copy()
+	if rows.empty:
+		output_path.parent.mkdir(parents=True, exist_ok=True)
+		pd.DataFrame(columns=['dataset', 'model', 'seed_count', *METRICS]).to_csv(output_path, index=False)
+		print(f'Wrote summary for 0 dataset/model groups: {output_path}')
+		return
 	if 'seed' in rows.columns:
 		# Re-running a seed replaces its prior contribution in the summary.
 		rows = rows.drop_duplicates(subset=['dataset', 'model', 'seed'], keep='last')
@@ -53,10 +96,7 @@ def main():
 	for output_name, metric in METRICS.items():
 		means = grouped[metric].mean()
 		stds = grouped[metric].std(ddof=1).fillna(0.0)
-		summary[output_name] = [
-			f'{mean:.{args.digits}f} ± {std:.{args.digits}f}' if pd.notna(mean) else '--'
-			for mean, std in zip(means, stds)
-		]
+		summary[output_name] = [f'{mean:.{args.digits}f} ± {std:.{args.digits}f}' for mean, std in zip(means, stds)]
 	summary = summary.reset_index()[['dataset', 'model', 'seed_count', *METRICS]]
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	summary.to_csv(output_path, index=False)
