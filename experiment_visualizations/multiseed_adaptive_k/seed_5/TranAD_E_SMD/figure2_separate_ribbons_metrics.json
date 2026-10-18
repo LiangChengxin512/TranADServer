@@ -1,0 +1,31 @@
+{
+  "checkpoint": "experiment_checkpoints/multiseed_adaptive_k/seed_5/TranAD_E_SMD/best.ckpt",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "start": 15748,
+  "length": 400,
+  "dimensions": [
+    0,
+    11,
+    12,
+    14
+  ],
+  "color_figure": "experiment_visualizations/multiseed_adaptive_k/seed_5/TranAD_E_SMD/figure2_anomaly_prediction_separate_ribbons_color.png",
+  "black_and_white_figure": "experiment_visualizations/multiseed_adaptive_k/seed_5/TranAD_E_SMD/figure2_anomaly_prediction_separate_ribbons_bw.png",
+  "adaptive_k_source": "seed-5 SMD test_metrics.json",
+  "f1": 0.9964362774355754,
+  "precision": 0.9955089783102208,
+  "recall": 0.9973753243442994,
+  "roc_auc": 0.9984552140187498,
+  "threshold": 0.32478753801757115,
+  "score_agg": "topk",
+  "score_topk": 2,
+  "selected_topk": null,
+  "train_score_mean": 0.033935241401195526,
+  "train_score_std": 0.04143969342112541,
+  "test_score_mean": 0.04926569387316704,
+  "test_score_std": 0.07655081152915955,
+  "dim_f1_mean": 0.5990888288035056,
+  "dim_precision_mean": 0.5377629137893764,
+  "dim_recall_mean": 0.7894736745284874
+}

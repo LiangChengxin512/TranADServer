@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/DAGMM_MSL/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.8481483068843527,
+  "precision": 0.7363420252650351,
+  "recall": 0.9999999677419366,
+  "roc_auc": 0.971596724667349,
+  "threshold": 0.01798948406840989,
+  "score_agg": "mean",
+  "train_score_mean": 0.004928871989250183,
+  "train_score_std": 0.007216776721179485,
+  "test_score_mean": 34532.546875,
+  "test_score_std": 248180.96875,
+  "dim_f1_mean": 0.6937147804137652,
+  "dim_precision_mean": 0.5987292189162783,
+  "dim_recall_mean": 0.8299119966890557
+}

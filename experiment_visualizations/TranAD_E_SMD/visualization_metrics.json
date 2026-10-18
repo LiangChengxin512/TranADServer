@@ -1,0 +1,30 @@
+{
+  "model": "TranAD_E",
+  "dataset": "SMD",
+  "checkpoint": "experiment_checkpoints/TranAD_E_SMD/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 15748,
+  "length": 400,
+  "dimensions": [
+    8,
+    12,
+    14,
+    13
+  ],
+  "focus_index": 16039,
+  "attention_available": true,
+  "f1": 0.9133648819747217,
+  "precision": 0.9951370424618167,
+  "recall": 0.8440194943981271,
+  "roc_auc": 0.9217966695934277,
+  "threshold": 0.4351900040519846,
+  "score_agg": "topk",
+  "train_score_mean": 0.39242690801620483,
+  "train_score_std": 0.006215178873389959,
+  "test_score_mean": 0.3973880410194397,
+  "test_score_std": 0.015485563315451145,
+  "dim_f1_mean": 0.5207065465756332,
+  "dim_precision_mean": 0.5315797423632311,
+  "dim_recall_mean": 0.5395058574154269
+}

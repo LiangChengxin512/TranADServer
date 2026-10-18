@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/CAE_M_SMAP/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.900657290177962,
+  "precision": 0.8192770994602727,
+  "recall": 0.9999999866310163,
+  "roc_auc": 0.9893644450174036,
+  "threshold": 0.2186392623997761,
+  "score_agg": "mean",
+  "train_score_mean": 0.02253652550280094,
+  "train_score_std": 0.04619203880429268,
+  "test_score_mean": 3762.4775390625,
+  "test_score_std": 122619.3828125,
+  "dim_f1_mean": 0.5695780538268517,
+  "dim_precision_mean": 0.560354746999606,
+  "dim_recall_mean": 0.5987165695358747
+}

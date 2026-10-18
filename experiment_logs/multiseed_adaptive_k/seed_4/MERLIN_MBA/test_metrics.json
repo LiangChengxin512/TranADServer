@@ -1,0 +1,18 @@
+{
+  "checkpoint": null,
+  "device": "cpu",
+  "dtype": "numpy",
+  "f1": 0.0937719860651477,
+  "precision": 0.9846153088757454,
+  "recall": 0.04923076904142012,
+  "roc_auc": 0.5244185342216838,
+  "score_agg": "MERLIN",
+  "merlin_status": "ok",
+  "threshold": null,
+  "discord_start": 4082,
+  "discord_length": 60,
+  "discord_distance": 0.12017802420610202,
+  "dim_f1_mean": 0.05640586596278048,
+  "dim_precision_mean": 0.9805193531793048,
+  "dim_recall_mean": 0.029038461426775145
+}

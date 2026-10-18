@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/CAE_M_UCR/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.0,
+  "precision": 0.0,
+  "recall": 0.0,
+  "roc_auc": 0.4920538953187079,
+  "threshold": 0.39021612113455806,
+  "score_agg": "mean",
+  "train_score_mean": 0.0658649429678917,
+  "train_score_std": 0.08214283734560013,
+  "test_score_mean": 0.06792386621236801,
+  "test_score_std": 0.09154896438121796,
+  "dim_f1_mean": 0.0,
+  "dim_precision_mean": 0.0,
+  "dim_recall_mean": 0.0
+}

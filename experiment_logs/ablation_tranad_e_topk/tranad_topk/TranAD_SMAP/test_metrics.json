@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/ablation_tranad_e_topk/tranad_topk/TranAD_SMAP/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.9072115269131061,
+  "precision": 0.8301886700312023,
+  "recall": 0.9999999866310163,
+  "roc_auc": 0.9901379399252288,
+  "threshold": 0.32876272267138446,
+  "score_agg": "topk",
+  "train_score_mean": 0.01777282916009426,
+  "train_score_std": 0.06978344917297363,
+  "test_score_mean": 31352.560546875,
+  "test_score_std": 1021787.4375,
+  "dim_f1_mean": 0.6896848667575157,
+  "dim_precision_mean": 0.6315983384666242,
+  "dim_recall_mean": 0.7599999898395724
+}

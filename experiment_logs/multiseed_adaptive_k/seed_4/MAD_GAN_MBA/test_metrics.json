@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/multiseed_adaptive_k/seed_4/MAD_GAN_MBA/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.9082919821326669,
+  "precision": 0.8319999973376,
+  "recall": 0.999999996153846,
+  "roc_auc": 0.9483267716535433,
+  "threshold": 0.03339100652421201,
+  "score_agg": "mean",
+  "score_topk": null,
+  "selected_topk": null,
+  "train_score_mean": 0.02387935109436512,
+  "train_score_std": 0.0175622645765543,
+  "test_score_mean": 0.02387935109436512,
+  "test_score_std": 0.0175622645765543,
+  "dim_f1_mean": 0.9061369394894119,
+  "dim_precision_mean": 0.8289119795805592,
+  "dim_recall_mean": 0.999999996153846
+}

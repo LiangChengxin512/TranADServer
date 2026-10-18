@@ -1,0 +1,27 @@
+{
+  "model": "TranAD_E",
+  "dataset": "UCR",
+  "checkpoint": "experiment_checkpoints/TranAD_E_UCR/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 1498,
+  "length": 400,
+  "dimensions": [
+    0
+  ],
+  "focus_index": 1619,
+  "attention_available": true,
+  "f1": 0.9527846289564811,
+  "precision": 0.9098359909970499,
+  "recall": 0.999999909909918,
+  "roc_auc": 0.9990499222663672,
+  "threshold": 0.04623968475938827,
+  "score_agg": "topk",
+  "train_score_mean": 0.008539780974388123,
+  "train_score_std": 0.00949615053832531,
+  "test_score_mean": 0.009148183278739452,
+  "test_score_std": 0.009455671533942223,
+  "dim_f1_mean": 0.9527846289564811,
+  "dim_precision_mean": 0.9098359909970499,
+  "dim_recall_mean": 0.999999909909918
+}

@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/GDN_SMD/best.ckpt",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "f1": 0.9192969110197206,
+  "precision": 0.8525640998315253,
+  "recall": 0.9973753243442994,
+  "roc_auc": 0.9897770798176031,
+  "threshold": 0.07682054085767881,
+  "score_agg": "mean",
+  "train_score_mean": 0.03884531185030937,
+  "train_score_std": 0.004265172872692347,
+  "test_score_mean": 0.044571567326784134,
+  "test_score_std": 0.018435336649417877,
+  "dim_f1_mean": 0.5937648552436402,
+  "dim_precision_mean": 0.5352646511972867,
+  "dim_recall_mean": 0.7368420959939157
+}

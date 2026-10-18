@@ -1,0 +1,30 @@
+{
+  "model": "TranAD_E",
+  "dataset": "synthetic",
+  "checkpoint": "experiment_checkpoints/TranAD_E_synthetic/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 1410,
+  "length": 400,
+  "dimensions": [
+    1,
+    11,
+    0,
+    14
+  ],
+  "focus_index": 1559,
+  "attention_available": true,
+  "f1": 0.9836015385903053,
+  "precision": 0.9677419159729453,
+  "recall": 0.9999999791666672,
+  "roc_auc": 0.9991596638655462,
+  "threshold": 0.14446339674547926,
+  "score_agg": "topk",
+  "train_score_mean": 0.05958268418908119,
+  "train_score_std": 0.02294147200882435,
+  "test_score_mean": 0.09200210869312286,
+  "test_score_std": 0.14547792077064514,
+  "dim_f1_mean": 0.7851608687948922,
+  "dim_precision_mean": 0.7101225153972374,
+  "dim_recall_mean": 0.8999998824074247
+}

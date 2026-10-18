@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/adaptive_k_ablation/seed_3/tranad_adaptive_topk/TranAD_UCR/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.9955106059090101,
+  "precision": 0.9910713400829161,
+  "recall": 0.999999909909918,
+  "roc_auc": 0.9999136292969425,
+  "threshold": 0.27465780436151405,
+  "score_agg": "topk",
+  "score_topk": "auto",
+  "selected_topk": 1,
+  "train_score_mean": 0.11848024278879166,
+  "train_score_std": 0.07808302342891693,
+  "test_score_mean": 0.1112317442893982,
+  "test_score_std": 0.07389682531356812,
+  "dim_f1_mean": 0.9955106059090101,
+  "dim_precision_mean": 0.9910713400829161,
+  "dim_recall_mean": 0.999999909909918
+}

@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/cge_adaptive_k_ablation/seed_5/tranad_c_e_adaptive_topk/TranAD_C_E_SMD/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.9992456519601953,
+  "precision": 0.9985024298071792,
+  "recall": 0.9999999962504686,
+  "roc_auc": 0.9999225166589184,
+  "threshold": 0.13537720442288242,
+  "score_agg": "topk",
+  "score_topk": "auto",
+  "selected_topk": 5,
+  "train_score_mean": 0.003304064506664872,
+  "train_score_std": 0.006393416319042444,
+  "test_score_mean": 0.008497142232954502,
+  "test_score_std": 0.027572613209486008,
+  "dim_f1_mean": 0.567251682005744,
+  "dim_precision_mean": 0.5138700647215572,
+  "dim_recall_mean": 0.7104967050563115
+}

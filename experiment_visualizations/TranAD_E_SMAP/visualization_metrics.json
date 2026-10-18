@@ -1,0 +1,30 @@
+{
+  "model": "TranAD_E",
+  "dataset": "SMAP",
+  "checkpoint": "experiment_checkpoints/TranAD_E_SMAP/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 2049,
+  "length": 400,
+  "dimensions": [
+    0,
+    19,
+    2,
+    3
+  ],
+  "focus_index": 2188,
+  "attention_available": true,
+  "f1": 0.9110790723089599,
+  "precision": 0.8366890286723823,
+  "recall": 0.9999999866310163,
+  "roc_auc": 0.9905891452881269,
+  "threshold": 0.35614011591055633,
+  "score_agg": "topk",
+  "train_score_mean": 0.022310519590973854,
+  "train_score_std": 0.07734903693199158,
+  "test_score_mean": 31352.376953125,
+  "test_score_std": 1021781.3125,
+  "dim_f1_mean": 0.6785918364115211,
+  "dim_precision_mean": 0.6304013631962363,
+  "dim_recall_mean": 0.7386096157939892
+}

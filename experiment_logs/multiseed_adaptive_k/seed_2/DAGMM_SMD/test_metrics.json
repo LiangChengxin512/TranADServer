@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/multiseed_adaptive_k/seed_2/DAGMM_SMD/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.9969964955392651,
+  "precision": 0.9966279468091871,
+  "recall": 0.9973753243442994,
+  "roc_auc": 0.998513326524561,
+  "threshold": 0.03462089438432093,
+  "score_agg": "mean",
+  "score_topk": null,
+  "selected_topk": null,
+  "train_score_mean": 0.0005574360257014632,
+  "train_score_std": 0.0011473620543256402,
+  "test_score_mean": 0.002354155294597149,
+  "test_score_std": 0.01203967910259962,
+  "dim_f1_mean": 0.5614338648682481,
+  "dim_precision_mean": 0.5007686772731949,
+  "dim_recall_mean": 0.7368420959939157
+}

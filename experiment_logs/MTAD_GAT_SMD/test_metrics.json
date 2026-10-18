@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/MTAD_GAT_SMD/best.ckpt",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "f1": 0.873845270960431,
+  "precision": 0.7775504215797999,
+  "recall": 0.9973753243442994,
+  "roc_auc": 0.9839464584012076,
+  "threshold": 0.2232347362504657,
+  "score_agg": "mean",
+  "train_score_mean": 0.006787564139813185,
+  "train_score_std": 0.011669997125864029,
+  "test_score_mean": 0.038550492376089096,
+  "test_score_std": 0.09648194164037704,
+  "dim_f1_mean": 0.5856024420065026,
+  "dim_precision_mean": 0.47816920663067314,
+  "dim_recall_mean": 0.803425124420661
+}

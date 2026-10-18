@@ -1,0 +1,27 @@
+{
+  "model": "TranAD_E",
+  "dataset": "NAB",
+  "checkpoint": "experiment_checkpoints/TranAD_E_NAB/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 1977,
+  "length": 400,
+  "dimensions": [
+    0
+  ],
+  "focus_index": 2082,
+  "attention_available": true,
+  "f1": 0.9411711188269714,
+  "precision": 0.8888885596709039,
+  "recall": 0.9999995833335069,
+  "roc_auc": 0.999625748502994,
+  "threshold": 0.07691347365834399,
+  "score_agg": "topk",
+  "train_score_mean": 0.031644370406866074,
+  "train_score_std": 0.0128531688824296,
+  "test_score_mean": 0.031644370406866074,
+  "test_score_std": 0.0128531688824296,
+  "dim_f1_mean": 0.9411711188269714,
+  "dim_precision_mean": 0.8888885596709039,
+  "dim_recall_mean": 0.9999995833335069
+}

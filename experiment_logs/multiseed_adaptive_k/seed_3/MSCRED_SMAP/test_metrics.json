@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/multiseed_adaptive_k/seed_3/MSCRED_SMAP/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.8899415104382377,
+  "precision": 0.8017148895850494,
+  "recall": 0.9999999866310163,
+  "roc_auc": 0.988075286837695,
+  "threshold": 0.007930698098586385,
+  "score_agg": "mean",
+  "score_topk": null,
+  "selected_topk": null,
+  "train_score_mean": 0.0005792349693365395,
+  "train_score_std": 0.0017086188308894634,
+  "test_score_mean": 3761.74072265625,
+  "test_score_std": 122596.078125,
+  "dim_f1_mean": 0.5464986311144469,
+  "dim_precision_mean": 0.502068741256104,
+  "dim_recall_mean": 0.5999999919786098
+}

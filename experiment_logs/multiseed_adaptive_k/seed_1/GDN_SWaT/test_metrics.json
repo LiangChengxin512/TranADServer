@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/multiseed_adaptive_k/seed_1/GDN_SWaT/best.ckpt",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "f1": 0.8136764804260949,
+  "precision": 0.9678800649276218,
+  "recall": 0.701863343138768,
+  "roc_auc": 0.849209913933234,
+  "threshold": 0.01606678684529119,
+  "score_agg": "mean",
+  "score_topk": null,
+  "selected_topk": null,
+  "train_score_mean": 0.0018853722140192986,
+  "train_score_std": 0.0035838421899825335,
+  "test_score_mean": 0.008470778353512287,
+  "test_score_std": 0.03319209814071655,
+  "dim_f1_mean": 0.8136764804260949,
+  "dim_precision_mean": 0.9678800649276218,
+  "dim_recall_mean": 0.701863343138768
+}

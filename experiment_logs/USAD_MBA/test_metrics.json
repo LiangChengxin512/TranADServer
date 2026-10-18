@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/USAD_MBA/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.9748731397582857,
+  "precision": 0.9509875605304039,
+  "recall": 0.999999996153846,
+  "roc_auc": 0.9868110236220473,
+  "threshold": 0.0031407441501786356,
+  "score_agg": "mean",
+  "train_score_mean": 0.0026963718701153994,
+  "train_score_std": 0.009859585203230381,
+  "test_score_mean": 0.0026963718701153994,
+  "test_score_std": 0.009859585203230381,
+  "dim_f1_mean": 0.9634165636245966,
+  "dim_precision_mean": 0.9294464077375373,
+  "dim_recall_mean": 0.999999996153846
+}

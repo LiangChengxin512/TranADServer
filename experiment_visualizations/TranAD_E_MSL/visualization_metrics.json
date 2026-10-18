@@ -1,0 +1,30 @@
+{
+  "model": "TranAD_E",
+  "dataset": "MSL",
+  "checkpoint": "experiment_checkpoints/TranAD_E_MSL/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 450,
+  "length": 400,
+  "dimensions": [
+    33,
+    7,
+    9,
+    5
+  ],
+  "focus_index": 467,
+  "attention_available": true,
+  "f1": 0.9494589959667135,
+  "precision": 0.9037900611139924,
+  "recall": 0.9999999677419366,
+  "roc_auc": 0.9915557830092119,
+  "threshold": 0.6896819694214836,
+  "score_agg": "topk",
+  "train_score_mean": 0.09706319123506546,
+  "train_score_std": 0.14791366457939148,
+  "test_score_mean": 633097.8125,
+  "test_score_std": 4549994.5,
+  "dim_f1_mean": 0.15309638343834867,
+  "dim_precision_mean": 0.1580954468288894,
+  "dim_recall_mean": 0.15601172517264233
+}

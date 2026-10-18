@@ -1,0 +1,23 @@
+{
+  "dataset": "MBA",
+  "model": "TranAD_E",
+  "epochs": 10,
+  "batch_size": 128,
+  "learning_rate": null,
+  "weight_decay": 1e-05,
+  "lr_step": 5,
+  "lr_gamma": 0.9,
+  "device": "mps",
+  "less": false,
+  "resume": false,
+  "checkpoint_dir": "experiment_checkpoints/multiseed_adaptive_k/seed_2",
+  "log_dir": "experiment_logs/multiseed_adaptive_k/seed_2",
+  "eval_every": 1,
+  "aux_weight": 1.0,
+  "assoc_weight": 0.01,
+  "memory_weight": 0.001,
+  "score_agg": "topk",
+  "score_topk": "auto",
+  "seed": 2,
+  "dtype": "torch.float32"
+}

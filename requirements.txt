@@ -1,0 +1,15 @@
+pandas<2.0.0
+tqdm
+matplotlib
+dgl
+numpy<2
+pyyaml
+pydantic
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+torchdata==0.7.1
+SciencePlots
+scikit-learn
+xlrd==1.2.0
+openpyxl

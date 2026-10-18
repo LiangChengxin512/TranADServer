@@ -1,0 +1,20 @@
+{
+  "checkpoint": "experiment_checkpoints/multiseed_adaptive_k/seed_3/DAGMM_UCR/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.6981086193483823,
+  "precision": 0.5362318581530503,
+  "recall": 0.999999909909918,
+  "roc_auc": 0.9917084125064778,
+  "threshold": 0.02374793051034755,
+  "score_agg": "mean",
+  "score_topk": null,
+  "selected_topk": null,
+  "train_score_mean": 0.0026907396968454123,
+  "train_score_std": 0.004116814583539963,
+  "test_score_mean": 0.003101475303992629,
+  "test_score_std": 0.004974567797034979,
+  "dim_f1_mean": 0.6981086193483823,
+  "dim_precision_mean": 0.5362318581530503,
+  "dim_recall_mean": 0.999999909909918
+}

@@ -1,0 +1,27 @@
+{
+  "model": "TranAD_E",
+  "dataset": "SWaT",
+  "checkpoint": "experiment_checkpoints/TranAD_E_SWaT/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "start": 1412,
+  "length": 400,
+  "dimensions": [
+    0
+  ],
+  "focus_index": 1679,
+  "attention_available": true,
+  "f1": 0.81508255249909,
+  "precision": 0.9999999774266372,
+  "recall": 0.6878881880762704,
+  "roc_auc": 0.843944099378882,
+  "threshold": 0.24281670032335873,
+  "score_agg": "topk",
+  "train_score_mean": 0.008413895964622498,
+  "train_score_std": 0.012045066803693771,
+  "test_score_mean": 0.02802363969385624,
+  "test_score_std": 0.08645876497030258,
+  "dim_f1_mean": 0.81508255249909,
+  "dim_precision_mean": 0.9999999774266372,
+  "dim_recall_mean": 0.6878881880762704
+}

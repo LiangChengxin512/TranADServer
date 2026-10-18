@@ -1,0 +1,18 @@
+{
+  "checkpoint": "experiment_checkpoints/MSCRED_NAB/best.ckpt",
+  "device": "mps",
+  "dtype": "torch.float32",
+  "f1": 0.7441807680154827,
+  "precision": 0.8421048199448317,
+  "recall": 0.6666663888890046,
+  "roc_auc": 0.8329590818363273,
+  "threshold": 0.04213921203041787,
+  "score_agg": "mean",
+  "train_score_mean": 0.000897997641004622,
+  "train_score_std": 0.007918233051896095,
+  "test_score_mean": 0.000897997641004622,
+  "test_score_std": 0.007918233051896095,
+  "dim_f1_mean": 0.7441807680154827,
+  "dim_precision_mean": 0.8421048199448317,
+  "dim_recall_mean": 0.6666663888890046
+}
