@@ -53,6 +53,17 @@ def load_processed_dataset(dataset, less=False):
 	arrays = []
 	for split in ['train', 'test', 'labels']:
 		arrays.append(np.load(os.path.join(folder, f'{prefix}{split}.npy')))
+	if dataset == 'MSDS' and arrays[2].shape[0] != arrays[1].shape[0]:
+		# Older processed MSDS labels were saved at the original sampling rate,
+		# while train/test were downsampled by five in preprocess.py.
+		aligned_labels = arrays[2][::5]
+		if aligned_labels.shape[0] != arrays[1].shape[0]:
+			raise ValueError(
+				f'MSDS labels have {arrays[2].shape[0]} rows but test data has '
+				f'{arrays[1].shape[0]} rows; applying the expected 5x label sampling '
+				'did not align them. Re-run `python preprocess.py MSDS`.'
+			)
+		arrays[2] = aligned_labels
 	if less:
 		arrays[0] = cut_array(0.2, arrays[0])
 	return arrays[0], arrays[1], arrays[2]
@@ -630,6 +641,26 @@ def select_adaptive_topk(train_loss, test_loss, labels, show_progress=False):
 
 
 def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, score_agg='mean', topk=3):
+	if test_loss.ndim != 2 or train_loss.ndim != 2 or labels.ndim != 2:
+		raise ValueError(
+			'Expected train_loss, test_loss, and labels to be 2D arrays; got '
+			f'{train_loss.shape}, {test_loss.shape}, and {labels.shape}.'
+		)
+	if test_loss.shape[0] != labels.shape[0]:
+		raise ValueError(
+			f'Test loss and labels have different row counts '
+			f'({test_loss.shape[0]} vs {labels.shape[0]}).'
+		)
+	if test_loss.shape[1] != labels.shape[1]:
+		raise ValueError(
+			f'Test loss and labels have different feature counts '
+			f'({test_loss.shape[1]} vs {labels.shape[1]}).'
+		)
+	if train_loss.shape[1] != test_loss.shape[1]:
+		raise ValueError(
+			f'Train and test loss have different feature counts '
+			f'({train_loss.shape[1]} vs {test_loss.shape[1]}).'
+		)
 	results = []
 	iterator = range(test_loss.shape[1])
 	if show_progress:

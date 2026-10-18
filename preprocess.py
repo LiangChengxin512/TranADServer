@@ -121,7 +121,8 @@ def load_data(dataset):
 		train, _, _ = normalize3(df_train, min_a, max_a)
 		test, _, _ = normalize3(df_test, min_a, max_a)
 		labels = pd.read_csv(os.path.join(dataset_folder, 'labels.csv'))
-		labels = labels.values[::1, 1:]
+		# Keep labels aligned with the same 5x sampling used for train/test.
+		labels = labels.values[::5, 1:]
 		for file in ['train', 'test', 'labels']:
 			np.save(os.path.join(folder, f'{file}.npy'), eval(file).astype('float64'))
 	elif dataset == 'SWaT':
