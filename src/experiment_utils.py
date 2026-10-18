@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from src.device import get_best_device, get_dtype_for_device, move_optimizer_to_device
@@ -468,7 +467,7 @@ def predict_tranad(model, windows, batch_size):
 			output = model(window, elem)
 			if isinstance(output, tuple):
 				output = output[1]
-			if getattr(model, 'uses_adaptive_topk', False):
+			if getattr(model, 'uses_kurtosis_aggregation', False):
 				losses.append((output - elem).abs()[0])
 			else:
 				losses.append(criterion(output, elem)[0])
@@ -670,7 +669,13 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		results.append(result)
 	per_dim = pd.DataFrame(results)
 	selected_topk = None
-	if score_agg == 'adaptive_topk':
+	if score_agg == 'kurtosis_gated':
+		from src.tranad_progressive import kurtosis_gated_normalized_aggregation
+		train_final, test_final, selected_topk = kurtosis_gated_normalized_aggregation(
+			train_loss, test_loss, topk=topk
+		)
+		final_result, final_pred = pot_eval(train_final, test_final, (np.sum(labels, axis=1) >= 1) + 0)
+	elif score_agg == 'adaptive_topk':
 		from src.tranad_progressive import adaptive_topk_scores
 		train_final, train_ks = adaptive_topk_scores(train_loss)
 		test_final, test_ks = adaptive_topk_scores(test_loss)
@@ -691,7 +696,8 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		'roc_auc': final_result['ROC/AUC'],
 		'threshold': final_result['threshold'],
 		'score_agg': score_agg,
-		'score_topk': ('adaptive' if score_agg == 'adaptive_topk' else
+		'score_topk': (_fixed_topk(topk, test_loss.shape[1]) if score_agg == 'kurtosis_gated' else
+			'adaptive' if score_agg == 'adaptive_topk' else
 			'auto' if is_auto_topk(topk) else
 			(_fixed_topk(topk, test_loss.shape[1]) if score_agg == 'topk' else None)),
 		'selected_topk': selected_topk,

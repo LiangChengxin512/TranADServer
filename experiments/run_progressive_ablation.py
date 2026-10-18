@@ -67,8 +67,17 @@ def processed_files(dataset):
 
 
 def warn_dataset_missing(dataset):
-	message = f'Warning: Dataset [{dataset}] not found, skipping...'
+	message = f'[WARN] Dataset {dataset} not found, skip.'
 	print(f'\033[93m{message}\033[0m', file=sys.stderr)
+
+
+def write_loss_curve(path, history):
+	"""Atomically persist the requested epoch/train/validation loss columns."""
+	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	temporary_path = path.with_name(path.name + '.tmp')
+	pd.DataFrame(history, columns=('epoch', 'train_loss', 'val_loss')).to_csv(temporary_path, index=False)
+	os.replace(temporary_path, path)
 
 
 def parse_args():
@@ -77,7 +86,7 @@ def parse_args():
 	parser.add_argument('--variant', choices=VARIANTS, required=True)
 	parser.add_argument('--dataset', choices=DATASETS, required=True)
 	parser.add_argument('--seed', type=int, default=1)
-	parser.add_argument('--epochs', type=int, default=10)
+	parser.add_argument('--epochs', type=int, default=15)
 	parser.add_argument('--batch-size', type=int, default=128)
 	parser.add_argument('--validation-fraction', type=float, default=0.1)
 	parser.add_argument('--patience', type=int, default=3)
@@ -89,7 +98,7 @@ def parse_args():
 		help='Checkpoint path; defaults to checkpoints/{dataset}/{variant}/seed_{seed}/model_best.pt.')
 	parser.add_argument('--log-dir', type=str, default=None)
 	parser.add_argument('--metrics-csv', type=str, default='experiments_results/ablation_raw_metrics.csv')
-	parser.add_argument('--score-agg', choices=('mean', 'adaptive_topk'), default=None)
+	parser.add_argument('--score-agg', choices=('mean', 'kurtosis_gated'), default=None)
 	parser.add_argument('--less', action='store_true', help='Train using 20%% of the available training series.')
 	return parser.parse_args()
 
@@ -107,6 +116,14 @@ def append_metrics(path, row):
 	if not path.is_absolute():
 		path = PROJECT_ROOT / path
 	path.parent.mkdir(parents=True, exist_ok=True)
+	if path.is_file() and path.stat().st_size > 0:
+		with path.open('r', newline='', encoding='utf-8') as existing_file:
+			existing_fields = next(csv.reader(existing_file), [])
+		if existing_fields != list(row):
+			raise ValueError(
+				f'Metrics CSV header in {path} does not match this runner. '
+				f'Expected {list(row)}, found {existing_fields}.'
+			)
 	with path.open('a', newline='', encoding='utf-8') as handle:
 		writer = csv.DictWriter(handle, fieldnames=list(row))
 		if path.stat().st_size == 0:
@@ -155,6 +172,8 @@ def main():
 	train_data, validation_data, _, _ = utils['prepare_experiment_data'](
 		model, train_split, validation_split, device, dtype
 	)
+	# Score normalization and POT calibration use the official training split;
+	# the held-out tail remains available for train-set residual statistics.
 	calibration_data = torch.cat((train_data, validation_data), dim=0)
 	_, test_data, _, _ = utils['prepare_experiment_data'](
 		model, train_split, test_np, device, dtype
@@ -170,7 +189,7 @@ def main():
 	if not log_dir.is_absolute():
 		log_dir = PROJECT_ROOT / log_dir
 	log_dir.mkdir(parents=True, exist_ok=True)
-	score_agg = args.score_agg or ('adaptive_topk' if args.variant == 'M4' else 'mean')
+	score_agg = args.score_agg or ('kurtosis_gated' if args.variant == 'M4' else 'mean')
 	config = {
 		'variant': args.variant,
 		'dataset': args.dataset,
@@ -183,13 +202,25 @@ def main():
 		'device': str(device),
 		'dtype': str(dtype),
 		'score_agg': score_agg,
+		'lr_scheduler': 'CosineAnnealingLR',
+		'graph_active_variance_epsilon': 1e-5,
+		'graph_soft_threshold_initial': 0.3,
+		'freq_loss_weight': model.freq_loss_weight,
+		'spectral_flatness_threshold': model.spectral_flatness_threshold,
+		'spectral_flatness_steepness': model.spectral_flatness_steepness,
+		'trend_loss_weight': model.trend_loss_weight,
+		'm4_topk': 3,
+		'm4_kurtosis_gate': 'centered_sigmoid',
 		'checkpoint': str(checkpoint_path),
 	}
 
 	if args.mode in ('train', 'train-test'):
 		optimizer = torch.optim.AdamW(model.parameters(), lr=model.lr, weight_decay=args.weight_decay)
-		scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5, 0.9)
+		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 		history = []
+		loss_curve = []
+		loss_curve_path = checkpoint_path.parent / 'loss_curve.csv'
+		checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 		aux_weights = {'default': 1.0, 'association': 0.01, 'memory_entropy': 0.001}
 		best_validation_loss = float('inf')
 		early_stopping_reference = float('inf')
@@ -208,12 +239,19 @@ def main():
 				'validation_reconstruction_loss': validation_loss,
 			}
 			history.append(row)
+			loss_curve.append({
+				'epoch': epoch + 1,
+				'train_loss': metrics['train_loss'],
+				'val_loss': validation_loss,
+			})
+			write_loss_curve(loss_curve_path, loss_curve)
 			print(row)
 			if validation_loss < best_validation_loss:
 				best_validation_loss = validation_loss
 				best_epoch = epoch
+				temporary_checkpoint = checkpoint_path.with_name(checkpoint_path.name + '.tmp')
 				utils['save_checkpoint'](
-					str(checkpoint_path),
+					str(temporary_checkpoint),
 					model,
 					optimizer,
 					scheduler,
@@ -221,6 +259,7 @@ def main():
 					{'validation_reconstruction_loss': validation_loss},
 					config,
 				)
+				os.replace(temporary_checkpoint, checkpoint_path)
 			if validation_loss < early_stopping_reference - args.min_delta:
 				early_stopping_reference = validation_loss
 				epochs_without_improvement = 0
