@@ -52,4 +52,6 @@ split = round(df_merged.shape[0] / 2)
 df_merged[:split].to_csv('train.csv')
 df_merged[split:].to_csv('test.csv')
 d = pd.DataFrame(0, index=np.arange(df_merged[split:].shape[0]), columns=df_merged.columns)
+# MSDS has no anomaly interval annotations; this all-zero file is a placeholder,
+# not ground truth suitable for supervised metric evaluation.
 d.to_csv('labels.csv')

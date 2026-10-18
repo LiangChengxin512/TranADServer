@@ -9,7 +9,7 @@ cd "$ROOT_DIR" || exit 1
 
 PYTHON=${PYTHON:-python3}
 DEVICE=${DEVICE:-auto}
-EPOCHS=${EPOCHS:-10}
+EPOCHS=${EPOCHS:-15}
 BATCH_SIZE=${BATCH_SIZE:-128}
 VALIDATION_FRACTION=${VALIDATION_FRACTION:-0.1}
 PATIENCE=${PATIENCE:-3}
@@ -32,10 +32,19 @@ dataset_prefix() {
 	esac
 }
 
+dataset_raw_dir() {
+	case "$1" in
+		MSL|SMAP) printf '%s' data/SMAP_MSL ;;
+		*) printf 'data/%s' "$1" ;;
+	esac
+}
+
 dataset_available() {
 	dataset=$1
 	prefix=$(dataset_prefix "$dataset")
 	folder="processed/$dataset"
+	raw_folder=$(dataset_raw_dir "$dataset")
+	[ -d "$raw_folder" ] &&
 	[ -f "$folder/${prefix}train.npy" ] &&
 	[ -f "$folder/${prefix}test.npy" ] &&
 	[ -f "$folder/${prefix}labels.npy" ]
@@ -45,7 +54,7 @@ for dataset in $DATASETS; do
 	if dataset_available "$dataset"; then
 		AVAILABLE_DATASETS="$AVAILABLE_DATASETS $dataset"
 	else
-		printf '\033[93mWarning: Dataset [%s] not found, skipping...\033[0m\n' "$dataset" >&2
+		printf '\033[93m[WARN] Dataset %s not found, skip.\033[0m\n' "$dataset" >&2
 	fi
 done
 

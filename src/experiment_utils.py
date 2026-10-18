@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from src.device import get_best_device, get_dtype_for_device, move_optimizer_to_device
 from src.folderconstants import output_folder
-from src.pot import calc_point2point, pot_eval
+from src.pot import calc_point2point, label_evaluation_status, pot_eval
 
 
 DATASET_PREFIX = {
@@ -615,6 +615,15 @@ def aggregate_scores(loss, method='mean', topk=3):
 def select_adaptive_topk(train_loss, test_loss, labels, show_progress=False):
 	labels_final = (np.sum(labels, axis=1) >= 1) + 0
 	n_features = int(test_loss.shape[1])
+	if n_features < 1:
+		raise ValueError('Adaptive top-k selection requires at least one feature dimension.')
+	if label_evaluation_status(labels_final) != 'ok':
+		# There is no ground truth with which to tune k. Use a deterministic
+		# top-1 score and let evaluation report the supervised metrics as NA.
+		train_final = aggregate_scores(train_loss, 'topk', topk=1)
+		test_final = aggregate_scores(test_loss, 'topk', topk=1)
+		result, pred = pot_eval(train_final, test_final, labels_final)
+		return 1, result, pred, train_final, test_final
 	best = None
 	best_rank = None
 	iterator = range(1, n_features + 1)
@@ -708,6 +717,7 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 		'dim_f1_mean': float(per_dim['f1'].mean()) if 'f1' in per_dim else 0.0,
 		'dim_precision_mean': float(per_dim['precision'].mean()) if 'precision' in per_dim else 0.0,
 		'dim_recall_mean': float(per_dim['recall'].mean()) if 'recall' in per_dim else 0.0,
+		'evaluation_status': label_evaluation_status((np.sum(labels, axis=1) >= 1) + 0),
 	}
 	return metrics, per_dim, np.asarray(final_pred), train_final, test_final
 
@@ -802,6 +812,17 @@ def evaluate_merlin(test_np, labels, min_length=60, max_length=62):
 
 
 def write_json(path, data):
+	def json_safe(value):
+		if isinstance(value, dict):
+			return {key: json_safe(item) for key, item in value.items()}
+		if isinstance(value, (list, tuple)):
+			return [json_safe(item) for item in value]
+		if isinstance(value, np.generic):
+			value = value.item()
+		if isinstance(value, float) and not np.isfinite(value):
+			return None
+		return value
+
 	os.makedirs(os.path.dirname(path), exist_ok=True)
 	with open(path, 'w', encoding='utf-8') as f:
-		json.dump(data, f, indent=2)
+		json.dump(json_safe(data), f, indent=2, allow_nan=False)

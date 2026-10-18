@@ -8,7 +8,12 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-METRICS = ('precision', 'recall', 'f1', 'roc_auc')
+METRICS = {
+	'Precision': 'precision',
+	'Recall': 'recall',
+	'F1': 'f1',
+	'ROC-AUC': 'roc_auc',
+}
 
 
 def parse_args():
@@ -31,21 +36,24 @@ def main():
 	if not input_path.is_file():
 		raise SystemExit(f'Raw metrics file not found: {input_path}')
 	rows = pd.read_csv(input_path)
-	required = {'dataset', 'model', *METRICS}
+	required = {'dataset', 'model', *METRICS.values()}
 	missing = required.difference(rows.columns)
 	if missing:
 		raise SystemExit(f'Metrics CSV is missing columns: {", ".join(sorted(missing))}')
-	for metric in METRICS:
+	for metric in METRICS.values():
 		rows[metric] = pd.to_numeric(rows[metric], errors='coerce')
+	if 'seed' in rows.columns:
+		# Re-running a seed replaces its prior contribution in the summary.
+		rows = rows.drop_duplicates(subset=['dataset', 'model', 'seed'], keep='last')
 	grouped = rows.groupby(['dataset', 'model'], sort=True, dropna=False)
 	if 'seed' in rows.columns:
 		summary = grouped.agg(seed_count=('seed', 'count'))
 	else:
 		summary = grouped.size().to_frame('seed_count')
-	for metric in METRICS:
+	for output_name, metric in METRICS.items():
 		means = grouped[metric].mean()
 		stds = grouped[metric].std(ddof=1).fillna(0.0)
-		summary[metric] = [
+		summary[output_name] = [
 			f'{mean:.{args.digits}f} ± {std:.{args.digits}f}' if pd.notna(mean) else '--'
 			for mean, std in zip(means, stds)
 		]

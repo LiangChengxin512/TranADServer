@@ -4,6 +4,20 @@ from src.spot import SPOT
 from src.constants import *
 from sklearn.metrics import *
 
+
+def label_evaluation_status(actual):
+    """Describe whether binary labels support supervised anomaly metrics."""
+    actual = np.asarray(actual).reshape(-1)
+    actual = actual[np.isfinite(actual)] > 0.1
+    if actual.size == 0:
+        return 'no_valid_labels'
+    if np.all(actual):
+        return 'no_negative_labels'
+    if not np.any(actual):
+        return 'no_positive_labels'
+    return 'ok'
+
+
 def calc_point2point(predict, actual):
     """
     calculate f1 score by predict and actual.
@@ -11,17 +25,26 @@ def calc_point2point(predict, actual):
         predict (np.ndarray): the predict label
         actual (np.ndarray): np.ndarray
     """
-    TP = np.sum(predict * actual)
-    TN = np.sum((1 - predict) * (1 - actual))
-    FP = np.sum(predict * (1 - actual))
-    FN = np.sum((1 - predict) * actual)
+    predict = np.asarray(predict).reshape(-1) > 0.5
+    actual = np.asarray(actual).reshape(-1) > 0.1
+    if predict.size != actual.size:
+        raise ValueError(f"predict and actual must have the same length ({predict.size} vs {actual.size})")
+    TP = np.sum(predict & actual)
+    TN = np.sum(~predict & ~actual)
+    FP = np.sum(predict & ~actual)
+    FN = np.sum(~predict & actual)
+    if label_evaluation_status(actual) != 'ok':
+        # A single-class ground truth cannot evaluate anomaly discrimination.
+        # Preserve confusion counts and predictions, but do not present zeros as
+        # measured precision/recall/F1/AUC.
+        return np.nan, np.nan, np.nan, TP, TN, FP, FN, np.nan
     precision = TP / (TP + FP + 0.00001)
     recall = TP / (TP + FN + 0.00001)
     f1 = 2 * precision * recall / (precision + recall + 0.00001)
     try:
-        roc_auc = roc_auc_score(actual, predict)
-    except:
-        roc_auc = 0
+        roc_auc = roc_auc_score(actual.astype(np.int8), predict.astype(np.int8))
+    except ValueError:
+        roc_auc = np.nan
     return f1, precision, recall, TP, TN, FP, FN, roc_auc
 
 
@@ -153,6 +176,8 @@ def pot_eval(init_score, score, label, q=1e-5, level=0.02):
     init_score = np.asarray(init_score, dtype=np.float64).reshape(-1)
     score = np.asarray(score, dtype=np.float64).reshape(-1)
     label = np.asarray(label).reshape(-1)
+    if score.size != label.size:
+        raise ValueError(f"score and label must have the same length ({score.size} vs {label.size})")
     finite_mask = np.isfinite(score)
     score = score[finite_mask]
     label = label[finite_mask]
@@ -166,6 +191,7 @@ def pot_eval(init_score, score, label, q=1e-5, level=0.02):
             'f1': p_t[0], 'precision': p_t[1], 'recall': p_t[2],
             'TP': p_t[3], 'TN': p_t[4], 'FP': p_t[5], 'FN': p_t[6],
             'ROC/AUC': p_t[7], 'threshold': pot_th,
+            'evaluation_status': label_evaluation_status(label),
         }, np.array(pred)
 
     s = None
@@ -189,6 +215,7 @@ def pot_eval(init_score, score, label, q=1e-5, level=0.02):
             'f1': p_t[0], 'precision': p_t[1], 'recall': p_t[2],
             'TP': p_t[3], 'TN': p_t[4], 'FP': p_t[5], 'FN': p_t[6],
             'ROC/AUC': p_t[7], 'threshold': pot_th,
+            'evaluation_status': label_evaluation_status(label),
         }, np.array(pred)
 
     ret = s.run(dynamic=False)  # run
@@ -214,5 +241,6 @@ def pot_eval(init_score, score, label, q=1e-5, level=0.02):
         'FN': p_t[6],
         'ROC/AUC': p_t[7],
         'threshold': pot_th,
+        'evaluation_status': label_evaluation_status(label),
         # 'pot-latency': p_latency
     }, np.array(pred)

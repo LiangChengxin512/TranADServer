@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 
 from src.device import get_best_device, get_dtype_for_device
+from src.pot import label_evaluation_status
 
 
 DATASET_PREFIX = {
@@ -155,6 +156,13 @@ def main():
 	device = get_best_device(args.device, model_name)
 	dtype = get_dtype_for_device(device)
 	train_np, test_np, labels = utils['load_processed_dataset'](args.dataset, less=args.less)
+	label_status = label_evaluation_status(np.any(labels > 0.1, axis=1))
+	if label_status != 'ok':
+		print(
+			f'[WARN] {args.dataset} ground-truth labels have status "{label_status}". '
+			'Anomaly scores and thresholds will still be produced, but '
+			'F1/precision/recall/ROC-AUC are unavailable and will be recorded as NaN/null.'
+		)
 	validation_size = max(1, int(np.ceil(train_np.shape[0] * args.validation_fraction)))
 	if validation_size >= train_np.shape[0]:
 		raise ValueError('Training data must contain at least two points for a train/validation split.')
