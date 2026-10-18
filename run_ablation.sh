@@ -46,6 +46,11 @@ msds_labels_available() {
 	"$PYTHON" -c 'import sys; from preprocess import msds_has_positive_labels; sys.exit(0 if msds_has_positive_labels() else 1)' >/dev/null 2>&1
 }
 
+processed_labels_available() {
+	labels_file=$1
+	"$PYTHON" -c 'import numpy as np, sys; a=np.load(sys.argv[1]); sys.exit(0 if np.any(np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)>0.1) else 1)' "$labels_file" >/dev/null 2>&1
+}
+
 dataset_available() {
 	dataset=$1
 	prefix=$(dataset_prefix "$dataset")
@@ -56,6 +61,16 @@ dataset_available() {
 		[ -f "$raw_folder/test.csv" ] &&
 		[ -f "$raw_folder/labels.csv" ] &&
 		msds_labels_available
+		return $?
+	fi
+	if [ "$dataset" = WADI ]; then
+		[ -f "$raw_folder/WADI_14days.csv" ] &&
+		[ -f "$raw_folder/WADI_attackdata.csv" ] &&
+		[ -f "$raw_folder/WADI_attacklabels.csv" ] &&
+		[ -f "$folder/${prefix}train.npy" ] &&
+		[ -f "$folder/${prefix}test.npy" ] &&
+		[ -f "$folder/${prefix}labels.npy" ] &&
+		processed_labels_available "$folder/${prefix}labels.npy"
 		return $?
 	fi
 	[ -d "$raw_folder" ] &&

@@ -3,7 +3,6 @@
 
 import argparse
 import csv
-import json
 import os
 import random
 import sys
@@ -177,6 +176,10 @@ def main():
 		print(f'[WARN] {exc}', file=sys.stderr)
 		return 0
 	label_status = label_evaluation_status(np.any(labels > 0.1, axis=1))
+	if args.dataset in {'MSDS', 'WADI'} and label_status != 'ok' and not np.any(labels > 0.1):
+		warn_dataset_missing(args.dataset)
+		print(f'[WARN] {args.dataset} has no positive anomaly labels; skipping without writing metrics.', file=sys.stderr)
+		return 0
 	if label_status != 'ok':
 		print(
 			f'[WARN] {args.dataset} ground-truth labels have status "{label_status}". '
@@ -192,6 +195,13 @@ def main():
 		lr_override=args.learning_rate,
 		seed=args.seed,
 	)
+	if int(args.variant[1]) >= 2 and getattr(model, 'graph_attention', None) is not None:
+		continuous = np.asarray([
+			(np.unique(train_np[:, feature]).size > 10)
+			and (np.std(train_np[:, feature]) > 1e-3)
+			for feature in range(train_np.shape[1])
+		], dtype=bool)
+		model.graph_attention.set_continuous_mask(continuous)
 	_, test_data, _, _ = utils['prepare_experiment_data'](
 		model, train_np, test_np, device, dtype
 	)
@@ -236,15 +246,13 @@ def main():
 		'graph_soft_threshold_initial': 0.3,
 		'prototype_count': 16,
 		'prototype_residual_scale': 0.1,
-		'm3_concordance_ratio_clip': [0.85, 1.25],
-		'm3_isolated_spike_shrinkage': 0.25,
-		'm3_train_only_non_degradation_guard': True,
-		'm4_aggregation': 'validation_selected_topk',
-		'm4_required_margin_gain': 'max(0.05, 10% of baseline margin)',
-		'm4_max_validation_exceedance_ratio': 0.9,
+		'm2_graph': 'continuous_channels_only_hollow_spatial_predictor',
+		'm2_fidelity_gate': 'blend_regressed_channels_toward_m1_using_last_20_percent_train_tail',
+		'm3_postprocessing': 'fixed_train_pot_threshold_short_weak_event_damp_and_sustained_multichannel_boost',
+		'm4_aggregation': 'unlabeled_test_event_prominence_topk_with_k_equals_d_fallback',
 		'checkpoint': str(checkpoint_path),
 	}
-	score_reference_path = checkpoint_path.parent / 'score_reference_epoch5.json'
+	epoch5_checkpoint_path = checkpoint_path.parent / 'model_epoch5.pt'
 
 	if args.mode in ('train', 'train-test'):
 		optimizer = torch.optim.AdamW(model.parameters(), lr=model.lr, weight_decay=args.weight_decay)
@@ -254,8 +262,6 @@ def main():
 		loss_curve = []
 		loss_curve_path = checkpoint_path.parent / 'loss_curve.csv'
 		checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-		if score_reference_path.exists():
-			score_reference_path.unlink()
 		aux_weights = {'default': 1.0, 'association': 0.01, 'memory_entropy': 0.001}
 		best_validation_loss = float('inf')
 		early_stopping_reference = float('inf')
@@ -283,38 +289,12 @@ def main():
 			if initial_reconstruction_loss is None:
 				initial_reconstruction_loss = metrics['recon_loss']
 			if epoch == 4:
-				epoch5_residuals, _, epoch5_base_score = utils['predict_tranad'](
-					model, train_data, args.batch_size, return_base_score=True
+				temporary_epoch5_path = epoch5_checkpoint_path.with_name(epoch5_checkpoint_path.name + '.tmp')
+				utils['save_checkpoint'](
+					str(temporary_epoch5_path), model, optimizer, scheduler, epoch,
+					{'validation_reconstruction_loss': validation_loss}, config,
 				)
-				if args.variant in ('M3', 'M4'):
-					from src.tranad_progressive import phase_concordance_guard
-					use_candidate, _ = phase_concordance_guard(epoch5_residuals, epoch5_base_score)
-					candidate_reference = {
-						'mean': np.mean(epoch5_residuals, axis=0).tolist(),
-						'std': np.std(epoch5_residuals, axis=0).tolist(),
-					}
-					baseline_reference = {
-						'mean': np.mean(epoch5_base_score, axis=0).tolist(),
-						'std': np.std(epoch5_base_score, axis=0).tolist(),
-					}
-					selected_reference = candidate_reference if use_candidate else baseline_reference
-					score_reference = {
-						'epoch': 5,
-						'mean': selected_reference['mean'],
-						'std': selected_reference['std'],
-						'candidate': candidate_reference,
-						'baseline': baseline_reference,
-					}
-				else:
-					score_reference = {
-						'epoch': 5,
-						'mean': np.mean(epoch5_residuals, axis=0).tolist(),
-						'std': np.std(epoch5_residuals, axis=0).tolist(),
-					}
-				temporary_reference_path = score_reference_path.with_name(score_reference_path.name + '.tmp')
-				with temporary_reference_path.open('w', encoding='utf-8') as handle:
-					json.dump(score_reference, handle, indent=2, allow_nan=False)
-				os.replace(temporary_reference_path, score_reference_path)
+				os.replace(temporary_epoch5_path, epoch5_checkpoint_path)
 			is_best = validation_loss < best_validation_loss
 			if is_best:
 				best_validation_loss = validation_loss
@@ -371,10 +351,33 @@ def main():
 	checkpoint_info = utils['load_checkpoint'](str(checkpoint_path), model, device=device, dtype=dtype)
 	best_epoch = int(checkpoint_info.get('epoch', -1)) + 1
 	best_validation_loss = checkpoint_info.get('metrics', {}).get('validation_reconstruction_loss')
-	score_reference = None
-	if score_reference_path.is_file():
-		with score_reference_path.open('r', encoding='utf-8') as handle:
-			score_reference = json.load(handle)
+	inference_epoch = best_epoch
+	inference_checkpoint = checkpoint_path
+	fallback_used = False
+	best_q98 = None
+	epoch5_q98 = None
+	if best_epoch > 5 and epoch5_checkpoint_path.is_file():
+		best_residuals, _, _ = utils['predict_tranad'](model, calibration_data, args.batch_size, return_base_score=True)
+		best_q98 = float(np.quantile(np.mean(best_residuals, axis=1), 0.98))
+		epoch5_info = utils['load_checkpoint'](str(epoch5_checkpoint_path), model, device=device, dtype=dtype)
+		epoch5_residuals, _, _ = utils['predict_tranad'](model, calibration_data, args.batch_size, return_base_score=True)
+		epoch5_q98 = float(np.quantile(np.mean(epoch5_residuals, axis=1), 0.98))
+		if np.isfinite(best_q98) and np.isfinite(epoch5_q98) and best_q98 < 0.85 * epoch5_q98:
+			fallback_used = True
+			inference_epoch = int(epoch5_info.get('epoch', 4)) + 1
+			inference_checkpoint = epoch5_checkpoint_path
+		else:
+			utils['load_checkpoint'](str(checkpoint_path), model, device=device, dtype=dtype)
+	fidelity_reference = None
+	if int(args.variant[1]) >= 2:
+		m1_checkpoint_path = checkpoint_path.parents[2] / 'M1' / f'seed_{args.seed}' / 'model_best.pt'
+		if m1_checkpoint_path.is_file():
+			m1_model = utils['build_model']('TranAD_M1', labels.shape[1], device, dtype,
+				batch_size=args.batch_size, seed=args.seed)
+			utils['load_checkpoint'](str(m1_checkpoint_path), m1_model, device=device, dtype=dtype)
+			m1_train_loss, _, _ = utils['predict_tranad'](m1_model, calibration_data, args.batch_size, return_base_score=True)
+			m1_test_loss, _, _ = utils['predict_tranad'](m1_model, test_data, args.batch_size, return_base_score=True)
+			fidelity_reference = (m1_train_loss, m1_test_loss)
 
 	metrics, per_dim, _, _ = utils['evaluate_experiment_model'](
 		model,
@@ -385,8 +388,8 @@ def main():
 		show_progress=True,
 		score_agg=score_agg,
 		topk=score_topk,
-		score_reference=score_reference,
 		best_epoch=best_epoch,
+		fidelity_reference=fidelity_reference,
 	)
 	metrics.update({
 		'variant': args.variant,
@@ -394,9 +397,17 @@ def main():
 		'seed': args.seed,
 		'best_epoch': best_epoch,
 		'best_validation_reconstruction_loss': best_validation_loss,
+		'inference_epoch': inference_epoch,
+		'inference_checkpoint': str(inference_checkpoint),
+		'epoch5_q98_fallback_used': fallback_used,
+		'best_checkpoint_train_score_q98': best_q98,
+		'epoch5_checkpoint_train_score_q98': epoch5_q98,
 	})
 	utils['write_json'](str(log_dir / 'test_metrics.json'), {
 		'checkpoint': str(checkpoint_path),
+		'inference_checkpoint': str(inference_checkpoint),
+		'inference_epoch': inference_epoch,
+		'epoch5_q98_fallback_used': fallback_used,
 		'device': str(device),
 		'dtype': str(dtype),
 		**metrics,

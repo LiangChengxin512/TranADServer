@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from src.device import get_best_device, get_dtype_for_device, move_optimizer_to_device
 from src.folderconstants import output_folder
-from src.pot import calc_point2point, label_evaluation_status, pot_eval
+from src.pot import adjust_predicts, calc_point2point, label_evaluation_status, pot_eval
 
 
 DATASET_PREFIX = {
@@ -85,10 +85,14 @@ def load_processed_dataset(dataset, less=False):
 				raise DatasetLabelsUnavailable(
 					'MSDS source labels remain empty after regeneration; supervised evaluation is skipped.'
 				)
+	elif dataset == 'WADI' and not all(os.path.isfile(path) for path in paths):
+		raise DatasetLabelsUnavailable(f'WADI processed files are incomplete: {folder}')
 	else:
 		if not os.path.exists(folder):
 			raise FileNotFoundError(f'Processed data not found: {folder}')
 		arrays = read_arrays()
+	if dataset == 'WADI' and not np.any(np.nan_to_num(arrays[2], nan=0.0, posinf=0.0, neginf=0.0) > 0.1):
+		raise DatasetLabelsUnavailable('WADI labels contain no positive anomaly annotations; supervised evaluation is skipped.')
 	if less:
 		arrays[0] = cut_array(0.2, arrays[0])
 	return arrays[0], arrays[1], arrays[2]
@@ -488,8 +492,6 @@ def predict_tranad(model, windows, batch_size, return_base_score=False):
 	criterion = nn.MSELoss(reduction='none')
 	feats = windows.shape[-1]
 	losses, preds = [], []
-	phase1_losses, phase2_losses = [], []
-	use_phase_concordance = int(getattr(model, 'variant_level', 0)) >= 3
 	with torch.no_grad():
 		for start_index in range(0, windows.shape[0], batch_size):
 			batch = windows[start_index:start_index + batch_size]
@@ -498,26 +500,11 @@ def predict_tranad(model, windows, batch_size, return_base_score=False):
 			elem = window[-1, :, :].view(1, local_bs, feats)
 			output = model(window, elem)
 			if isinstance(output, tuple):
-				phase1, phase2 = output
-				output = phase2
-				if use_phase_concordance:
-					phase1_losses.append((phase1 - elem).abs()[0].detach().cpu().numpy())
-					phase2_losses.append((phase2 - elem).abs()[0].detach().cpu().numpy())
-			if not use_phase_concordance:
-				if getattr(model, 'uses_kurtosis_aggregation', False):
-					losses.append((output - elem).abs()[0])
-				else:
-					losses.append(criterion(output, elem)[0])
+				_, output = output
+			losses.append(criterion(output, elem)[0])
 			preds.append(output[0])
-	if use_phase_concordance:
-		from src.tranad_progressive import phase_concordant_residuals, zero_smearing_spike_filter
-		phase1 = np.concatenate(phase1_losses, axis=0)
-		phase2 = np.concatenate(phase2_losses, axis=0)
-		losses_np = zero_smearing_spike_filter(phase_concordant_residuals(phase1, phase2))
-		base_score = np.square(phase2)
-	else:
-		losses_np = torch.cat(losses, dim=0).detach().cpu().numpy()
-		base_score = losses_np
+	losses_np = torch.cat(losses, dim=0).detach().cpu().numpy()
+	base_score = losses_np
 	predictions_np = torch.cat(preds, dim=0).detach().cpu().numpy()
 	if return_base_score:
 		return losses_np, predictions_np, base_score
@@ -562,12 +549,6 @@ def predict_dagmm(model, windows, batch_size=None):
 	final_pred = _last_window_features(preds, model.n_feats)
 	final_loss = _last_window_features(loss, model.n_feats)
 	return final_loss.detach().cpu().numpy(), final_pred.detach().cpu().numpy()
-
-
-def _anchor_tranad_train_scores(train_loss, score_reference=None, best_epoch=None):
-	"""Apply epoch-five train-score anchoring without altering test residuals."""
-	from src.tranad_progressive import anchor_residual_scale
-	return anchor_residual_scale(train_loss, score_reference, best_epoch, anchor_epoch=5)
 
 
 def predict_usad(model, windows, batch_size=None):
@@ -760,38 +741,79 @@ def evaluate_loss_arrays(train_loss, test_loss, labels, show_progress=False, sco
 
 
 def evaluate_tranad(model, train_windows, test_windows, labels, batch_size, show_progress=False,
-		score_agg='mean', topk=3, score_reference=None, best_epoch=None):
-	train_loss, _, train_base_score = predict_tranad(
-		model, train_windows, batch_size, return_base_score=True
-	)
-	test_loss, y_pred, test_base_score = predict_tranad(
-		model, test_windows, batch_size, return_base_score=True
-	)
-	phase_concordance_applied = False
-	phase_concordance_margin_gain = None
-	if int(getattr(model, 'variant_level', 0)) >= 3:
-		from src.tranad_progressive import select_phase_concordance_scores
-		train_loss, test_loss, phase_concordance_applied, phase_concordance_margin_gain = (
-			select_phase_concordance_scores(
-				train_loss, train_base_score, test_loss, test_base_score
-			)
+		score_agg='mean', topk=3, score_reference=None, best_epoch=None, fidelity_reference=None):
+	train_loss, _, _ = predict_tranad(model, train_windows, batch_size, return_base_score=True)
+	test_loss, y_pred, _ = predict_tranad(model, test_windows, batch_size, return_base_score=True)
+	fidelity_mask = np.zeros(train_loss.shape[1], dtype=bool)
+	if int(getattr(model, 'variant_level', 0)) >= 2 and fidelity_reference is not None:
+		from src.tranad_progressive import apply_channel_fidelity_gate
+		train_loss, test_loss, fidelity_mask = apply_channel_fidelity_gate(
+			train_loss, test_loss, fidelity_reference[0], fidelity_reference[1]
 		)
-	selected_reference = score_reference
-	if isinstance(score_reference, dict) and ('candidate' in score_reference or 'baseline' in score_reference):
-		reference_key = 'candidate' if phase_concordance_applied else 'baseline'
-		selected_reference = score_reference.get(reference_key, score_reference)
-	train_loss, anchor_applied = _anchor_tranad_train_scores(
-		train_loss, selected_reference, best_epoch
+	variant_level = int(getattr(model, 'variant_level', 0))
+	if variant_level < 3:
+		metrics, per_dim, _, _, _ = evaluate_loss_arrays(
+			train_loss, test_loss, labels, show_progress=show_progress, score_agg=score_agg, topk=topk
+		)
+		metrics['m2_fidelity_gated_channels'] = int(np.sum(fidelity_mask))
+		return metrics, per_dim, y_pred, test_loss
+
+	# Per-channel metrics remain available for diagnostics; the aggregate M3/M4
+	# decision uses one fixed POT threshold estimated before test-score shaping.
+	_, per_dim, _, _, _ = evaluate_loss_arrays(
+		train_loss, test_loss, labels, show_progress=show_progress, score_agg='mean'
 	)
-	metrics, per_dim, _, _, _ = evaluate_loss_arrays(
-		train_loss, test_loss, labels, show_progress=show_progress, score_agg=score_agg, topk=topk
-	)
-	metrics['score_calibration'] = 'epoch5_residual_scale_anchor' if anchor_applied else 'none'
-	metrics['epoch5_scale_anchor_applied'] = bool(anchor_applied)
-	if int(getattr(model, 'variant_level', 0)) >= 3:
-		metrics['phase_concordance_applied'] = bool(phase_concordance_applied)
-		metrics['phase_concordance_validation_margin_gain'] = float(phase_concordance_margin_gain)
+	labels_any = (np.sum(labels, axis=1) >= 1).astype(np.int8)
+	if variant_level >= 4:
+		from src.tranad_progressive import select_m4_topk
+		selected = select_m4_topk(train_loss, test_loss)
+		train_score = selected['train_score']
+		test_score = selected['test_score']
+		threshold = selected['threshold']
+		metrics = _fixed_score_metrics(train_score, test_score, labels_any, threshold)
+		metrics.update({
+			'score_agg': 'kurtosis_gated_event_topk',
+			'score_topk': selected['k'],
+			'selected_topk': selected['k'],
+			'm4_robust_event_count': selected['profile']['robust_events'],
+			'm4_robust_event_prominence': selected['profile']['prominence'],
+			'm4_suppressed_glitch_events': selected['suppressed_glitch_events'],
+			'm3_boosted_sustained_segments': selected['boosted_sustained_segments'],
+		})
+	else:
+		from src.tranad_progressive import boost_sustained_segments, suppress_marginal_glitches
+		train_score = np.mean(train_loss, axis=1)
+		test_score = np.mean(test_loss, axis=1)
+		threshold_result, _ = pot_eval(
+			train_score, test_score, np.zeros(test_score.size, dtype=np.int8)
+		)
+		threshold = float(threshold_result['threshold'])
+		test_score, glitch_info = suppress_marginal_glitches(test_score, threshold)
+		test_score, boosted = boost_sustained_segments(test_score, train_score, train_loss.shape[1])
+		metrics = _fixed_score_metrics(train_score, test_score, labels_any, threshold)
+		metrics.update({
+			'score_agg': 'mean_m3_event_filtered',
+			'm3_suppressed_glitch_events': glitch_info['suppressed_glitch_events'],
+			'm3_boosted_sustained_segments': boosted,
+		})
+	metrics['m2_fidelity_gated_channels'] = int(np.sum(fidelity_mask))
+	metrics['score_calibration'] = 'locked_train_pot_threshold'
+	metrics['dim_f1_mean'] = float(per_dim['f1'].mean()) if 'f1' in per_dim else 0.0
+	metrics['dim_precision_mean'] = float(per_dim['precision'].mean()) if 'precision' in per_dim else 0.0
+	metrics['dim_recall_mean'] = float(per_dim['recall'].mean()) if 'recall' in per_dim else 0.0
 	return metrics, per_dim, y_pred, test_loss
+
+
+def _fixed_score_metrics(train_score, test_score, labels, threshold):
+	pred = adjust_predicts(test_score, labels, threshold)
+	f1, precision, recall, tp, tn, fp, fn, roc_auc = calc_point2point(pred, labels)
+	return {
+		'f1': f1, 'precision': precision, 'recall': recall, 'roc_auc': roc_auc,
+		'TP': tp, 'TN': tn, 'FP': fp, 'FN': fn,
+		'threshold': float(threshold), 'train_score_mean': float(np.mean(train_score)),
+		'train_score_std': float(np.std(train_score)), 'test_score_mean': float(np.mean(test_score)),
+		'test_score_std': float(np.std(test_score)), 'evaluation_status': label_evaluation_status(labels),
+	}
 
 
 def evaluate_omni(model, train_sequence, test_sequence, labels, batch_size, show_progress=False, score_agg='mean', topk=3):
@@ -804,12 +826,13 @@ def evaluate_omni(model, train_sequence, test_sequence, labels, batch_size, show
 
 
 def evaluate_experiment_model(model, train_data, test_data, labels, batch_size, show_progress=False,
-		score_agg='mean', topk=3, score_reference=None, best_epoch=None):
+		score_agg='mean', topk=3, score_reference=None, best_epoch=None, fidelity_reference=None):
 	if is_tranad_model(model):
 		return evaluate_tranad(
 			model, train_data, test_data, labels, batch_size,
 			show_progress=show_progress, score_agg=score_agg, topk=topk,
 			score_reference=score_reference, best_epoch=best_epoch,
+			fidelity_reference=fidelity_reference,
 		)
 	if is_omni_model(model):
 		return evaluate_omni(

@@ -57,12 +57,23 @@ class NormalPrototypeMemory(nn.Module):
 		self.prototypes = nn.Parameter(torch.randn(prototypes, hidden_size) * 0.02)
 		self.alpha = nn.Parameter(torch.tensor(float(initial_scale)))
 
-	def forward(self, hidden):
+	def forward(self, hidden, channel_mask=None):
+		if channel_mask is not None:
+			mask = torch.as_tensor(channel_mask, dtype=hidden.dtype, device=hidden.device).reshape(-1)
+			if mask.numel() * 2 != self.hidden_size:
+				raise ValueError('Prototype channel mask must match half the hidden width.')
+			mask = mask.repeat(2).view(1, 1, -1)
+			query = hidden * mask
+		else:
+			mask = None
+			query = hidden
 		address = torch.softmax(
-			torch.matmul(hidden, self.prototypes.transpose(0, 1)) / math.sqrt(self.hidden_size),
+			torch.matmul(query, self.prototypes.transpose(0, 1)) / math.sqrt(self.hidden_size),
 			dim=-1,
 		)
 		memory = torch.matmul(address, self.prototypes)
+		if mask is not None:
+			memory = memory * mask
 		return hidden + self.alpha * memory
 
 
@@ -119,6 +130,39 @@ class AdaptiveGatedGraphAttention(nn.Module):
 		return torch.where(active.unsqueeze(0), updated, x)
 
 
+class HollowSpatialPredictor(nn.Module):
+	"""Cross-channel predictor that never sends a feature message to itself."""
+
+	def __init__(self, n_features, variance_epsilon=ACTIVE_VARIANCE_EPS):
+		super().__init__()
+		self.n_features = int(n_features)
+		self.variance_epsilon = float(variance_epsilon)
+		self.channel_logits = nn.Parameter(torch.randn(n_features, n_features) * 0.02)
+		self.alpha = nn.Parameter(torch.tensor(0.1))
+		self.register_buffer('continuous_mask', torch.ones(n_features, dtype=torch.bool), persistent=False)
+		self.register_buffer('hollow_mask', ~torch.eye(n_features, dtype=torch.bool), persistent=False)
+
+	def set_continuous_mask(self, mask):
+		mask = torch.as_tensor(mask, dtype=torch.bool, device=self.continuous_mask.device).reshape(-1)
+		if mask.numel() != self.n_features:
+			raise ValueError(f'Continuous mask has {mask.numel()} entries for {self.n_features} channels.')
+		self.continuous_mask.copy_(mask)
+
+	def forward(self, x):
+		if self.n_features <= 1:
+			return x
+		active = self.continuous_mask
+		if active.numel() != self.n_features:
+			active = torch.ones(self.n_features, dtype=torch.bool, device=x.device)
+		# Non-continuous channels neither send nor receive messages. The hollow
+		# mask is applied on every call, so the diagonal remains exactly zero.
+		pair_mask = active[:, None] & active[None, :] & self.hollow_mask
+		weights = F.relu(self.channel_logits) * pair_mask.to(x.dtype)
+		weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(SCORE_EPS)
+		message = torch.einsum('tbd,od->tbo', x, weights)
+		return x + self.alpha * message * active.to(x.dtype).view(1, 1, -1)
+
+
 def progressive_reconstruction_loss(model, outputs, target, epoch):
 	"""Keep TranAD's two-stage objective unchanged for every ablation level.
 
@@ -149,114 +193,164 @@ def adaptive_topk_scores(residuals):
 	return scores, ks
 
 
-def phase_concordant_residuals(phase1_residuals, phase2_residuals, lower=0.85, upper=1.25):
-	"""Sharpen phase-two absolute error using its instantaneous phase ratio."""
-	phase1 = np.asarray(phase1_residuals, dtype=np.float64)
-	phase2 = np.asarray(phase2_residuals, dtype=np.float64)
-	if phase1.shape != phase2.shape or phase1.ndim != 2:
-		raise ValueError('Phase residuals must have matching [time, channels] shapes.')
-	if not 0.0 < lower <= upper:
-		raise ValueError('Concordance ratio bounds must satisfy 0 < lower <= upper.')
-	ratio = (phase2 + SCORE_EPS) / (phase1 + SCORE_EPS)
-	return phase2 * np.clip(ratio, lower, upper)
+def apply_channel_fidelity_gate(m2_train, m2_test, m1_train, m1_test, tail_fraction=0.2):
+	"""Blend M2 channels toward M1 when their unlabeled train tail regresses."""
+	arrays = [np.asarray(value, dtype=np.float64).copy() for value in (m2_train, m2_test, m1_train, m1_test)]
+	train, test, baseline_train, baseline_test = arrays
+	if train.ndim != 2 or test.ndim != 2 or baseline_train.shape != train.shape or baseline_test.shape != test.shape:
+		raise ValueError('M1/M2 fidelity inputs must be matching [time, channels] matrices.')
+	if train.shape[1] != test.shape[1] or train.shape[1] == 1 or train.shape[0] < 5:
+		return train, test, np.zeros(train.shape[1], dtype=bool)
+	start = max(0, int(train.shape[0] * (1.0 - tail_fraction)))
+	m2_tail = np.mean(train[start:], axis=0)
+	m1_tail = np.mean(baseline_train[start:], axis=0)
+	regressed = m2_tail > m1_tail + SCORE_EPS
+	blend = np.zeros(train.shape[1], dtype=np.float64)
+	# If a channel's M2 tail is worse, use its M1 residual as the safe endpoint.
+	blend[regressed] = 1.0
+	train = train * (1.0 - blend[None, :]) + baseline_train * blend[None, :]
+	test = test * (1.0 - blend[None, :]) + baseline_test * blend[None, :]
+	return train, test, regressed
 
 
-def zero_smearing_spike_filter(residuals, shrinkage=0.25, isolation_ratio=1.5):
-	"""Shrink only isolated high points using a trailing three-point second max.
-
-	The output at time t depends only on t and its two predecessors, so a high
-	point never alters any later score. Two-point-or-shorter inputs pass through.
-	"""
-	values = np.asarray(residuals, dtype=np.float64)
-	if values.ndim != 2:
-		raise ValueError('Spike filtering expects a [time, channels] matrix.')
-	if not 0.0 <= shrinkage <= 1.0 or isolation_ratio <= 1.0:
-		raise ValueError('Use shrinkage in [0, 1] and an isolation ratio above 1.')
-	filtered = values.copy()
-	for index in range(2, values.shape[0]):
-		second = np.maximum(values[index - 1], values[index - 2])
-		isolated = values[index] > isolation_ratio * np.maximum(second, SCORE_EPS)
-		filtered[index, isolated] = (
-			(1.0 - shrinkage) * values[index, isolated]
-			+ shrinkage * second[isolated]
-		)
-	return filtered
+def _event_spans(over_mask, merge_gap=2):
+	indices = np.flatnonzero(over_mask)
+	if not indices.size:
+		return []
+	spans = []
+	start = previous = int(indices[0])
+	for index in indices[1:]:
+		index = int(index)
+		if index - previous - 1 > merge_gap:
+			spans.append((start, previous + 1))
+			start = index
+		previous = index
+	spans.append((start, previous + 1))
+	return spans
 
 
-def anchor_residual_scale(residuals, reference, best_epoch, anchor_epoch=5):
-	"""Restore init-score scale toward epoch five when a later checkpoint shrinks it."""
-	values = np.asarray(residuals, dtype=np.float64)
-	if values.ndim != 2:
-		raise ValueError('Residual scale anchoring expects [time, channels] values.')
-	if reference is None or int(best_epoch or 0) <= anchor_epoch:
-		return values.copy(), False
-	ref_mean = np.asarray(reference.get('mean', []), dtype=np.float64).reshape(-1)
-	ref_std = np.asarray(reference.get('std', []), dtype=np.float64).reshape(-1)
-	if ref_mean.size != values.shape[1] or ref_std.size != values.shape[1]:
-		return values.copy(), False
-	best_mean = np.mean(values, axis=0)
-	best_std = np.std(values, axis=0)
-	anchored = ref_mean[None, :] + (ref_std / (best_std + SCORE_EPS))[None, :] * (
-		values - best_mean[None, :]
-	)
-	anchored = np.nan_to_num(anchored, nan=0.0, posinf=np.finfo(np.float64).max, neginf=0.0)
-	return np.maximum(values, anchored), True
+def suppress_marginal_glitches(scores, threshold, rho=0.45, max_duration=2, peak_ratio=2.2, merge_gap=2):
+	"""Dampen only short, weak score clusters while keeping the threshold fixed."""
+	values = np.asarray(scores, dtype=np.float64).reshape(-1).copy()
+	if not 0.0 <= rho <= 1.0 or max_duration < 1 or peak_ratio <= 1.0:
+		raise ValueError('Invalid glitch suppression parameters.')
+	spans = _event_spans(values > threshold, merge_gap=merge_gap)
+	suppressed = 0
+	for start, stop in spans:
+		peak = float(np.max(values[start:stop]))
+		ratio = peak / max(float(threshold), SCORE_EPS)
+		if stop - start <= max_duration and ratio < peak_ratio:
+			mask = values[start:stop] > threshold
+			values[start + np.flatnonzero(mask)] *= rho
+			suppressed += 1
+	return values, {'suppressed_glitch_events': suppressed, 'threshold_events': len(spans)}
 
 
-def _pot_tail_profile(calibration_score, validation_score, quantile=0.99):
-	"""Return unlabeled POT tail margin and validation exceedance rate."""
+def boost_sustained_segments(test_score, train_score, n_features, window=50, run_length=30, factor=1.35):
+	"""Boost sustained multichannel score elevations using causal rolling means."""
+	test = np.asarray(test_score, dtype=np.float64).reshape(-1).copy()
+	train = np.asarray(train_score, dtype=np.float64).reshape(-1)
+	if int(n_features) < 20 or test.size < run_length or train.size < 1:
+		return test, 0
+	window = max(1, min(int(window), train.size, test.size))
+	def trailing_mean(values):
+		cumulative = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
+		indices = np.arange(values.size)
+		starts = np.maximum(0, indices - window + 1)
+		return (cumulative[indices + 1] - cumulative[starts]) / (indices - starts + 1)
+	cutoff = float(np.quantile(trailing_mean(train), 0.95))
+	above = trailing_mean(test) > cutoff
+	spans = _event_spans(above, merge_gap=0)
+	boosted = 0
+	for start, stop in spans:
+		if stop - start >= run_length:
+			test[start:stop] *= factor
+			boosted += 1
+	return test, boosted
+
+
+def _topk_event_profile(score, threshold, train_score=None, merge_gap=2):
+	values = np.asarray(score, dtype=np.float64).reshape(-1)
+	spans = _event_spans(values > threshold, merge_gap=merge_gap)
+	robust = []
+	weak = 0
+	prominence = 0.0
+	robust_prominence = 0.0
+	train = np.asarray(train_score, dtype=np.float64).reshape(-1) if train_score is not None else np.array([])
+	noise_floor = float(np.quantile(train, 0.98)) if train.size else 0.0
+	noise_scale = max(float(np.std(train)), SCORE_EPS) if train.size else 1.0
+	robust_snr = 0.0
+	for start, stop in spans:
+		segment = values[start:stop]
+		ratio = float(np.max(segment)) / max(float(threshold), SCORE_EPS)
+		is_robust = stop - start >= 3 or ratio >= 2.2
+		if is_robust:
+			robust.append((start, stop))
+		segment_prominence = float(np.maximum(segment - threshold, 0.0).sum())
+		prominence += segment_prominence
+		if is_robust:
+			robust_prominence += segment_prominence
+			robust_snr += max(0.0, (float(np.max(segment)) - noise_floor) / noise_scale)
+		if stop - start <= 2 and ratio < 2.2:
+			weak += 1
+	return {
+		'robust_events': len(robust), 'prominence': prominence,
+		'robust_prominence': robust_prominence, 'robust_snr': robust_snr,
+		'weak_events': weak,
+	}
+
+
+def m4_candidate_ks(n_features):
+	values = {int(n_features)}
+	values.update(k for k in (1, 2, 3, 4, 5, 8, 12, 16) if k <= n_features)
+	k = 32
+	while k < n_features:
+		values.add(k)
+		k *= 2
+	return sorted(values)
+
+
+def select_m4_topk(train_residuals, test_residuals, n_features=None):
+	"""Select Top-K by unlabeled test event shape; threshold is fitted on train."""
 	from src.pot import pot_eval
-	calibration_score = np.asarray(calibration_score, dtype=np.float64).reshape(-1)
-	validation_score = np.asarray(validation_score, dtype=np.float64).reshape(-1)
-	result, _ = pot_eval(
-		calibration_score,
-		validation_score,
-		np.zeros(validation_score.size, dtype=np.int8),
-	)
-	threshold = float(result['threshold'])
-	if not np.isfinite(threshold):
-		return float('-inf'), float('inf')
-	tail = float(np.quantile(validation_score, quantile))
-	spread = float(np.quantile(calibration_score, 0.75) - np.quantile(calibration_score, 0.25))
-	margin = (tail - threshold) / max(spread, SCORE_EPS)
-	exceedance = float(np.mean(validation_score > threshold))
-	return margin, exceedance
-
-
-def phase_concordance_guard(candidate_residuals, baseline_residuals, quantile=0.99):
-	"""Enable M3 sharpening only when a held-out train tail supports it."""
-	candidate = np.asarray(candidate_residuals, dtype=np.float64)
-	baseline = np.asarray(baseline_residuals, dtype=np.float64)
-	if candidate.shape != baseline.shape or candidate.ndim != 2:
-		raise ValueError('M3 candidate and baseline residuals must have matching 2D shapes.')
-	if candidate.shape[0] < 10 or candidate.shape[1] == 0:
-		return False, 0.0
-	split = max(1, min(candidate.shape[0] - 1, int(np.floor(candidate.shape[0] * 0.8))))
-	base_profile = _pot_tail_profile(
-		baseline[:split].mean(axis=1), baseline[split:].mean(axis=1), quantile
-	)
-	candidate_profile = _pot_tail_profile(
-		candidate[:split].mean(axis=1), candidate[split:].mean(axis=1), quantile
-	)
-	margin_gain = candidate_profile[0] - base_profile[0]
-	meaningful_gain = max(0.05, abs(base_profile[0]) * 0.1)
-	use_candidate = (
-		np.isfinite(margin_gain)
-		and margin_gain > meaningful_gain
-		and candidate_profile[1] <= base_profile[1] + 1e-12
-	)
-	return bool(use_candidate), float(margin_gain) if np.isfinite(margin_gain) else 0.0
-
-
-def select_phase_concordance_scores(
-		train_candidate, train_baseline, test_candidate, test_baseline, quantile=0.99):
-	"""Apply one train-only M3 gate consistently to calibration and test scores."""
-	use_candidate, margin_gain = phase_concordance_guard(
-		train_candidate, train_baseline, quantile=quantile
-	)
-	if use_candidate:
-		return train_candidate, test_candidate, True, margin_gain
-	return train_baseline, test_baseline, False, margin_gain
+	train = np.asarray(train_residuals, dtype=np.float64)
+	test = np.asarray(test_residuals, dtype=np.float64)
+	features = train.shape[1] if n_features is None else int(n_features)
+	if train.ndim != 2 or test.ndim != 2 or train.shape[1] != test.shape[1] or features != train.shape[1]:
+		raise ValueError('M4 selection expects matching [time, channels] residual arrays.')
+	candidates = []
+	for k in m4_candidate_ks(features):
+		train_score = _topk_channel_mean(train, k)
+		test_score = _topk_channel_mean(test, k)
+		result, _ = pot_eval(train_score, test_score, np.zeros(test_score.size, dtype=np.int8))
+		threshold = float(result['threshold'])
+		processed, glitch_info = suppress_marginal_glitches(test_score, threshold)
+		processed, boosted = boost_sustained_segments(processed, train_score, features)
+		profile = _topk_event_profile(processed, threshold, train_score=train_score)
+		candidates.append({
+			'k': k, 'train_score': train_score, 'test_score': processed,
+			'threshold': threshold, 'profile': profile,
+			'suppressed_glitch_events': glitch_info['suppressed_glitch_events'],
+			'boosted_sustained_segments': boosted,
+		})
+	baseline = next(item for item in candidates if item['k'] == features)
+	selected = baseline
+	base_profile = baseline['profile']
+	for item in candidates:
+		if item['k'] == features:
+			continue
+		profile = item['profile']
+		retains_events = profile['robust_events'] >= base_profile['robust_events']
+		improves_prominence = profile['robust_prominence'] > base_profile['robust_prominence'] * 1.01 + SCORE_EPS
+		improves_snr = profile['robust_snr'] > base_profile['robust_snr'] * 1.01 + SCORE_EPS
+		reduces_glitches = item['suppressed_glitch_events'] < baseline['suppressed_glitch_events']
+		if retains_events and (improves_prominence or improves_snr or reduces_glitches):
+			if (profile['robust_events'], profile['robust_snr'], profile['robust_prominence'], -item['suppressed_glitch_events']) > (
+				selected['profile']['robust_events'], selected['profile']['robust_snr'],
+				selected['profile']['robust_prominence'], -selected['suppressed_glitch_events'],
+			):
+				selected = item
+	return selected
 
 
 def _topk_channel_mean(residuals, k):
@@ -354,7 +448,7 @@ def make_tranad_ablation_class(variant):
 			self.variant_level = int(variant[1])
 			conv_scale = 0.02 if feats == 1 else 0.1
 			self.causal_embedding = MultiScaleCausalEmbedding(2 * feats, conv_scale) if self.variant_level >= 1 else None
-			self.graph_attention = AdaptiveGatedGraphAttention(feats) if self.variant_level >= 2 else None
+			self.graph_attention = HollowSpatialPredictor(feats) if self.variant_level >= 2 else None
 			self.prototype_memory = NormalPrototypeMemory(2 * feats) if self.variant_level >= 2 else None
 			self.uses_monotonic_topk = self.variant_level >= 4
 
@@ -371,7 +465,8 @@ def make_tranad_ablation_class(variant):
 			src = self.pos_encoder(src)
 			memory = self.transformer_encoder(src)
 			if self.prototype_memory is not None:
-				memory = self.prototype_memory(memory)
+				mask = self.graph_attention.continuous_mask if self.graph_attention is not None else None
+				memory = self.prototype_memory(memory, mask)
 			tgt = tgt.repeat(1, 1, 2)
 			return tgt, memory
 
